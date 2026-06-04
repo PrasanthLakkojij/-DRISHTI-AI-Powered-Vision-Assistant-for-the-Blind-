@@ -1,0 +1,2 @@
+# -DRISHTI-AI-Powered-Vision-Assistant-for-the-Blind-
+For millions of visually impaired people, daily life is challenging. DRISHTI is an AI-powered visual assistant that acts as their eyes. Using object detection,face recognition,text reading,voice guidance,and emergency support,it helps users navigate safely,identify people,access information,and live with greater confidence,independence,and dignity.
