@@ -14,6 +14,7 @@ DRISHTI is an AI-powered visual assistant that helps visually impaired individua
 | 🔐 Voice Authentication | Only the registered owner can use DRISHTI |
 | 👁️ Object Detection | Real-time YOLO-based detection with distance estimation |
 | 👤 Face Recognition | Identifies known people and announces their name |
+| 🗣️ change Language  | changes language from one to one |
 | 📖 Text Reading (OCR) | Reads signs, labels, and documents aloud |
 | 🧭 Place Navigation | Guides user to saved locations |
 | 🔊 Telugu Voice Support | All responses in Telugu language |
@@ -75,11 +76,11 @@ Then say **"Hey Jarvis"** to start!
 | Say **"listen"** | Open voice command menu (in Telugu) |
 | Say **"s.o.s"** | Emergency call via Twilio |
 | Say **"send message"** | Send SMS to a number |
-| say **Save person** | Save a face of a person |
-| say **save place** | save a particulare place  |
-| say **where is place** | Enters into navigation mode |
-| say **cancel** | cancel current command |
-| Press **Change language** | changes to another language |
+| say **"Save person"** | Save a face of a person |
+| say **"save place"** | save a particulare place  |
+| say **"where is place"** | Enters into navigation mode |
+| say **"cancel"** | cancel current command |
+| Press **"Change language"** | changes to another language |
 
 
 ---
