@@ -29,7 +29,7 @@ DRISHTI is an AI-powered visual assistant that helps visually impaired individua
 
 ```bash
 git clone https://github.com/PrasanthLakkojij/-DRISHTI-AI-Powered-Vision-Assistant-for-the-Blind-.git
-cd -DRISHTI-AI-Powered-Vision-Assistant-for-the-Blind-
+cd '.\-DRISHTI-AI-Powered-Vision-Assistant-for-the-Blind-'
 ```
 
 ### Step 2 — Create a virtual environment (recommended)
