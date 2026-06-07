@@ -1,0 +1,21 @@
+# 🔐 Secret files — NEVER upload these
+.env
+
+# Python virtual environment
+drishti_env/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Model cache
+*.pt
+*.onnx
+
+# Face and voice data (personal/private)
+known_faces/
+*.npy
+
+# OS files
+.DS_Store
+Thumbs.db
