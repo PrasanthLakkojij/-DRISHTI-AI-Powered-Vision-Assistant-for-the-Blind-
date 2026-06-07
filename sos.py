@@ -1,23 +1,5 @@
 
-
-'''
-from twilio.rest import Client
-
-sid = "ACe4dc585d5e791912e0661c1b4477ac3c"
-token = "abafdf8620f76808868e3af8600edb2e"
-
-client = Client(sid, token)
-
-message = client.messages.create(
-    body="Hello! This message was sent from Python.",
-    from_="whatsapp:+14155238886",  # Twilio WhatsApp sandbox number
-    to="whatsapp:+919133773230"
-)
-
-print("Message sent:", message.sid)'''
-
-
-
+ 
 
 
 from dotenv import load_dotenv
@@ -25,12 +7,12 @@ import os
 
 load_dotenv()
 
-account_sid = os.getenv("ACe4dc585d5e791912e0661c1b4477ac3c")
-auth_token  = os.getenv("abafdf8620f76808868e3af8600edb2e")
+account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+auth_token  = os.getenv("TWILIO_AUTH_TOKEN")
 
 
 
-
+num=["7842174988","9133773230"]
 
 
 
@@ -43,7 +25,7 @@ client = Client(account_sid,auth_token)
 message = client.messages.create(
     body="Hello! This is a normal SMS from Python.",
     from_="+1 901 593 5722",
-    to="+917842174988"
+    to=num
 )
 
 print(message.sid)
@@ -58,7 +40,6 @@ print(message.sid)
 from twilio.rest import Client
 
 client = Client(account_sid,auth_token)
-num=["7842174988","9133773230"]
 call = client.calls.create(
     to=num,
     from_="+1 901 593 5722",
