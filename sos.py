@@ -20,12 +20,25 @@ print("Message sent:", message.sid)'''
 
 
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+account_sid = os.getenv("ACe4dc585d5e791912e0661c1b4477ac3c")
+auth_token  = os.getenv("abafdf8620f76808868e3af8600edb2e")
+
+
+
+
+
+
 
 
 
 from twilio.rest import Client
 
-client = Client("ACe4dc585d5e791912e0661c1b4477ac3c", "abafdf8620f76808868e3af8600edb2e")
+client = Client(account_sid,auth_token)
 
 message = client.messages.create(
     body="Hello! This is a normal SMS from Python.",
@@ -44,7 +57,7 @@ print(message.sid)
 
 from twilio.rest import Client
 
-client = Client("ACe4dc585d5e791912e0661c1b4477ac3c", "abafdf8620f76808868e3af8600edb2e")
+client = Client(account_sid,auth_token)
 num=["7842174988","9133773230"]
 call = client.calls.create(
     to=num,
