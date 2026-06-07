@@ -1,5 +1,6 @@
 
 https://github.com/aliasad20/dlib-19.22.1_whl/raw/main/dlib-19.22.1-cp39-cp39-win_amd64.whl
+
 cmake
 openwakeword==0.6.0
 pyaudio==0.2.14
