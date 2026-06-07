@@ -70,15 +70,17 @@ Then say **"Hey Jarvis"** to start!
 
 | Input | Action |
 |---|---|
+| say **Menu** | says available commands  |
 | Say **"Hey Jarvis"** | Wake up DRISHTI |
 | Say **"listen"** | Open voice command menu (in Telugu) |
 | Say **"s.o.s"** | Emergency call via Twilio |
 | Say **"send message"** | Send SMS to a number |
-| Press **S** | Save a face or place |
-| Press **W** | Enter place-navigation mode |
-| Press **R** | Reset navigation destination |
-| Press **ESC** | Exit navigation → back to default mode |
-| Press **Q** | Quit |
+| say **Save person** | Save a face of a person |
+| say **save place** | save a particulare place  |
+| say **where is place** | Enters into navigation mode |
+| say **cancel** | cancel current command |
+| Press **Change language** | changes to another language |
+
 
 ---
 
