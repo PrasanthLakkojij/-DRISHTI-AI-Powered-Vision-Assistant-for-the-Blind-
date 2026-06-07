@@ -12,7 +12,7 @@ auth_token  = os.getenv("TWILIO_AUTH_TOKEN")
 
 
 
-num=["7842174988","9133773230"]
+num = os.getenv("EMERGENCY_CONTACTS", "").split(",")
 
 
 
@@ -24,7 +24,7 @@ client = Client(account_sid,auth_token)
 
 message = client.messages.create(
     body="Hello! This is a normal SMS from Python.",
-    from_="TWILIO_PHONE_NUMBER",
+    from_=os.getenv("TWILIO_PHONE_NUMBER"),
     to=num
 )
 
@@ -42,7 +42,7 @@ from twilio.rest import Client
 client = Client(account_sid,auth_token)
 call = client.calls.create(
     to=num,
-    from_="TWILIO_PHONE_NUMBER",
+    from_=os.getenv("TWILIO_PHONE_NUMBER"),
     twiml="""
 <Response>
     <Say language="en-IN">
