@@ -19,6 +19,11 @@
 ║   NEW VOICE COMMANDS:                                                 ║
 ║   "send message" → asks number, confirms, asks msg, sends SMS        ║
 ║   "s.o.s"        → emergency call via Twilio                         ║
+║   "describe"     → repeating Groq scene description (say cancel)     ║
+║                                                                      ║
+║   NOTE: Voice thresholds below are tuned for EARPHONE use (little/no ║
+║   acoustic bleed from speaker into mic). If you switch to speakers,  ║
+║   raise energy_threshold back up (see comment at that line).         ║
 ║                                                                      ║
 ║   INSTALL:                                                            ║
 ║   pip install openwakeword                                           ║
@@ -28,13 +33,28 @@
 ║   pip install ultralytics face_recognition                           ║
 ║   pip install SpeechRecognition pyaudio                              ║
 ║   pip install sounddevice scipy speechbrain                          ║
-║   pip install twilio easyocr                                         ║
+║   pip install twilio                                                  ║
+║   pip install groq                                                   ║
+║   pip install python-dotenv                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 import re, os, asyncio, numpy as np, sounddevice as sd, pygame, edge_tts
 from scipy.io.wavfile import write as wav_write
+
+# ── Load secrets (Twilio, Groq) from a local .env file ──────────────
+# Create a file named ".env" in this same folder containing lines like:
+#   TWILIO_ACCOUNT_SID=...
+#   TWILIO_AUTH_TOKEN=...
+#   TWILIO_FROM_NUMBER=...
+#   GROQ_API_KEY=...
+# Never commit .env to git or paste its contents anywhere.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("[Env] python-dotenv not installed — run: pip install python-dotenv")
 
 # ══════════════════════════════════════════════════════════════════
 # SECTION -1 — OPENWAKEWORD GATE  ("Hey Jarvis")
@@ -160,16 +180,63 @@ _wait_for_wake_word()
 
 
 # ══════════════════════════════════════════════════════════════════
+# FIRST-TIME INTRODUCTION — plays right after "Hey Jarvis", before any
+# voice auth, only if this device has never enrolled an owner before.
+# ══════════════════════════════════════════════════════════════════
+
+_OWNER_EMBED_PATH_EARLY = "owner_voice.npy"  # same path used later in SECTION 0
+
+def _speak_intro_blocking(text: str) -> None:
+    """Minimal, self-contained TTS used only here — the full speak_force()
+    helper doesn't exist yet this early in the file (it depends on things
+    defined further down), so this plays once, directly, and blocks until
+    done."""
+    import tempfile as _tempfile_early
+    try:
+        if not pygame.mixer.get_init():
+            for _freq in (44100, 22050, 16000):
+                try:
+                    pygame.mixer.pre_init(_freq, -16, 1, 512)
+                    pygame.mixer.init()
+                    break
+                except Exception:
+                    try: pygame.mixer.quit()
+                    except Exception: pass
+        fd, path = _tempfile_early.mkstemp(suffix=".mp3")
+        os.close(fd)
+        asyncio.run(edge_tts.Communicate(text, voice="te-IN-ShrutiNeural").save(path))
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            import time as _t2; _t2.sleep(0.05)
+        pygame.mixer.music.unload()
+        os.remove(path)
+    except Exception as e:
+        print(f"[Intro TTS] Error: {e}")
+
+if not os.path.exists(_OWNER_EMBED_PATH_EARLY):
+    print("[Intro] First-ever run detected — playing introduction before enrollment.")
+    _speak_intro_blocking(
+        "నమస్కారం, నేను దృష్టి. చూపు లేని వారికి సహాయంగా ఉండటానికి తయారు చేయబడ్డాను. "
+        "నేను మీ ముందు ఉన్న వ్యక్తులు, వస్తువులు చెప్పగలను, దృశ్యాన్ని వివరించగలను, "
+        "స్థలాలకు నావిగేషన్ చేయగలను, టెక్స్ట్ చదవగలను, మరియు అత్యవసర సమయంలో సహాయం కోరగలను. "
+        "ఇప్పుడు మీ గొంతును నమోదు చేసుకుందాం."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
 # SECTION 0 — VOICE AUTHENTICATION
 # ══════════════════════════════════════════════════════════════════
 
 print("[Auth] Loading SpeechBrain speaker model...")
 from speechbrain.inference.speaker import SpeakerRecognition
-from speechbrain.utils.fetching import LocalStrategy
+
 _auth_model = SpeakerRecognition.from_hparams(
     source="speechbrain/spkrec-ecapa-voxceleb",
-    savedir="pretrained_models/spkrec",
-    local_strategy=LocalStrategy.COPY,
+    savedir="pretrained_models/spkrec"
+    #local_strategy=LocalStrategy.COPY,
 )
 print("[Auth] Speaker model loaded ✅")
 
@@ -177,7 +244,7 @@ _AUTH_SAMPLE_RATE  = 16000
 _AUTH_DURATION     = 5
 _OWNER_EMBED_PATH  = "owner_voice.npy"
 _OWNER_FOLDER      = "owner_recordings"
-_AUTH_THRESHOLD    = 0.75
+_AUTH_THRESHOLD    = 0.30
 _AUTH_MAX_ATTEMPTS = 3
 os.makedirs(_OWNER_FOLDER, exist_ok=True)
 
@@ -244,6 +311,8 @@ def _enroll_owner() -> None:
     print("[Auth] Owner voice saved ✅")
     _auth_speak("మీ గొంతు నమోదు అయింది. దృష్టి మొదలవుతుంది")
 
+_FIRST_TIME_SETUP = False
+
 def _verify_owner() -> bool:
     if not os.path.exists(_OWNER_EMBED_PATH):
         print("[Auth] No owner profile found — running first-time enrollment")
@@ -295,7 +364,7 @@ def _preload_models_bg():
     # YOLO
     try:
         from ultralytics import YOLO as _YOLO
-        yolo = _YOLO("yolov8n.pt")
+        yolo = _YOLO("yolov8s.pt")
         yolo.fuse()
         with _model_lock: _model_ready["yolo"] = True
         print("[YOLO] Ready ✅  (preloaded during auth)")
@@ -400,7 +469,7 @@ print("✅ All models ready. Starting DRISHTI...\n")
 # SECTION 1 — IMPORTS (models already loaded above)
 # ══════════════════════════════════════════════════════════════════
 
-import cv2, threading, tempfile, pickle, queue
+import cv2, threading, tempfile, pickle, queue, audioop, json
 from pathlib import Path
 from PIL import Image
 
@@ -422,12 +491,65 @@ except ImportError:
     TWILIO_OK = False
     print("[Twilio] Not installed — SMS/SOS disabled. Run: pip install twilio")
 
+# ── Earphone button fallback (requires: pip install keyboard) ──────
+# ANY earphone (any brand/model) reports at least ONE of the media-key
+# names below when its button is pressed — which exact one varies (some
+# only send 'play/pause media', some send 'next track', some send both
+# volume keys), so a SINGLE press of ANY of them now triggers activation.
+# No more double/triple-click patterns — those only worked reliably on
+# one specific earphone model.
+try:
+    import keyboard as _kb
+    KEYBOARD_OK = True
+    print("[Hotkey] 'keyboard' library available ✅ — earphone-button fallback enabled")
+except ImportError:
+    KEYBOARD_OK = False
+    print("[Hotkey] 'keyboard' not installed — earphone-button fallback disabled. Run: pip install keyboard")
+
 import face_recognition as _fr
 
-TWILIO_ACCOUNT_SID = "ACe4dc585d5e791912e0661c1b4477ac3c"
-TWILIO_AUTH_TOKEN  = "abafdf8620f76808868e3af8600edb2e"
-TWILIO_FROM_NUMBER = "+19015935722"
+# ── Groq (scene description) ───────────────────────────────────────
+try:
+    import base64 as _b64
+    from groq import Groq as _GroqClient
+    GROQ_OK = True
+    print("[Groq] Available ✅")
+except ImportError:
+    GROQ_OK = False
+    print("[Groq] Not installed — describe command disabled. Run: pip install groq")
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
 SOS_NUMBERS        = ["+917842174988"]
+
+# ── Groq scene-description config (ported from scene_loop_groq.py) ─
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+# Reverted to llama-4-scout for speed — qwen3.6-27b is a reasoning model
+# and its <think> step made both describe and OCR noticeably slower.
+# llama-4-scout is deprecated by Groq but NOT shut down yet (shutdown
+# date is 07/17/26 per https://console.groq.com/docs/deprecations) so
+# it's fine to use for now — just plan to migrate to qwen/qwen3.6-27b
+# (or whatever Groq's current vision model is by then) before that date,
+# since requests will start failing after it.
+GROQ_SCENE_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_TIMEOUT_SECONDS = 10
+GROQ_MAX_OUTPUT_TOKENS = 80
+GROQ_DESCRIBE_INTERVAL_SECONDS = 5
+GROQ_FRAME_MAX_WIDTH = 480
+GROQ_JPEG_QUALITY    = 70
+GROQ_MAX_RETRIES     = 2
+GROQ_RETRY_BACKOFF_SECONDS = 1.5
+
+PROMPT_TELUGU_SCENE = (
+    "ఈ దృశ్యాన్ని ఒక్క చిన్న వాక్యంలో తెలుగులో వివరించండి, 15 పదాలలోపు. "
+    "ముఖ్యమైన వ్యక్తులు, వస్తువులు, ఆటంకాలు మాత్రమే చెప్పండి. "
+    "తెలుగులో మాత్రమే సమాధానం ఇవ్వండి, ఇంగ్లీష్ వద్దు. ముందుమాట లేకుండా నేరుగా చెప్పండి."
+)
+
+_groq_client = _GroqClient(api_key=GROQ_API_KEY) if (GROQ_OK and GROQ_API_KEY) else None
+if GROQ_OK and not GROQ_API_KEY:
+    print("[Groq] GROQ_API_KEY not set — describe command will fail until it is set.")
 
 # ══════════════════════════════════════════════════════════════════
 # GLOBAL MODE FLAGS
@@ -460,16 +582,16 @@ SUPPORTED_LANGUAGES = {
     "urdu"      : ("ur-PK-UzmaNeural",    "ur-PK",  "اردو"),
 }
 LANG_SPOKEN_FORMS = {
-    "telugu"   :["telugu","Telugu","తెలుగు","తెలుగ్","तेलुगु","தெலுங்கு","ತೆಲುಗು","തെലുഗു"],
+    "telugu"   :["telugu","Telugu","తెలుగు","తెలుగ్","तेलुगु","தெலுங்கு","ತೆಲುಗు","తెలుగు"],
     "hindi"    :["hindi","Hindi","హిందీ","हिंदी","இந்தி","ಹಿಂದಿ","ഹിന്ദി"],
-    "tamil"    :["tamil","Tamil","తమిళం","తమిళ్","तमिल","தமிழ்","ತಮಿಳು","തമിഴ്"],
+    "tamil"    :["tamil","Tamil","తమిళం","తమిళ్","तमिल","தமிழ்","ತಮಿಳు","തமിഴ്"],
     "kannada"  :["kannada","Kannada","కన్నడ","कन्नड","கன்னடம்","ಕನ್ನಡ","കന്നഡ"],
     "malayalam":["malayalam","Malayalam","మలయాళం","मलयालम","மலையாளம்","ಮಲಯಾಳಂ","മലയാളം"],
     "bengali"  :["bengali","Bengali","బెంగాలీ","बंगाली","வங்காளம்","ಬೆಂಗಾಲಿ","ബംഗാളി","বাংলা"],
-    "marathi"  :["marathi","Marathi","మరాఠీ","मराठी","மராத்தி","ಮರಾಠಿ","മറാഠി"],
+    "marathi"  :["marathi","Marathi","మరాఠీ","मराठी","மராத்தி","ಮರಾಠಿ","മറാഠి"],
     "english"  :["english","English","ఇంగ్లీష్","अंग्रेजी","ஆங்கிலம்","ಇಂಗ್ಲಿಷ್","ഇംഗ്ലീഷ്"],
-    "gujarati" :["gujarati","Gujarati","గుజరాతీ","गुजराती","குஜராத்தி","ಗುಜರಾತಿ","ഗുജറാത്തി","ગુજرাதী"],
-    "urdu"     :["urdu","Urdu","ఉర్దూ","उर्दू","உருது","ಉರ್ದು","ഉർദു","اردو"],
+    "gujarati" :["gujarati","Gujarati","గుజరాతీ","गुजराती","குஜராத்தி","ಗುಜరాతి","ഗുജറാത്തി","ગુજરાતી"],
+    "urdu"     :["urdu","Urdu","ఉర్దూ","उर्दू","உருது","ಉರ್ದु","ഉർദু","اردو"],
 }
 _current_lang      = "telugu"
 _current_lang_lock = threading.Lock()
@@ -494,20 +616,64 @@ def get_lang_changed_msg(lang_key: str) -> str:
             "tamil":"மொழி தமிழுக்கு மாற்றப்பட்டது","kannada":"ಭಾಷೆ ಕನ್ನಡಕ್ಕೆ ಬದಲಾಯಿಸಲಾಗಿದೆ",
             "malayalam":"ഭാഷ മലയാളത്തിലേക്ക് മാറ്റി","english":"Language changed to English",
             "bengali":"ভাষা বাংলায় পরিবর্তিত হয়েছে","marathi":"भाषा मराठीत बदलली आहे",
-            "gujarati":"ભાષા ગુજरাதીમાં બدলвामां આвी","urdu":"زبان اردو میں تبدیل کر دی گئی",
+            "gujarati":"ભાષા ગુજરાતીમાં બદલાઈ","urdu":"زبان اردو میں تبدیل کر دی گئی",
             }.get(lang_key, "Language changed")
+
+def _lc_ask_prompt(lang_key: str, lang_list: str) -> str:
+    """'Which language?' prompt, spoken in lang_key instead of always Telugu."""
+    return {
+        "telugu":f"ఏ భాషకు మార్చాలి? అందుబాటులో: {lang_list}",
+        "hindi":f"कौन सी भाषा में बदलें? उपलब्ध: {lang_list}",
+        "tamil":f"எந்த மொழிக்கு மாற்றவும்? கிடைக்கும்: {lang_list}",
+        "kannada":f"ಯಾವ ಭಾಷೆಗೆ ಬದಲಾಯಿಸಬೇಕು? ಲಭ್ಯವಿరುವவு: {lang_list}",
+        "malayalam":f"ഏത് ഭാഷയിలేక్ మారత్తనం? లభ్యమయ్: {lang_list}",
+        "english":f"Which language should I switch to? Available: {lang_list}",
+    }.get(lang_key, f"Which language should I switch to? Available: {lang_list}")
+
+def _lc_not_heard_msg(lang_key: str) -> str:
+    """Spoken when nothing was heard during the language-change flow."""
+    return {
+        "telugu":"వినబడలేదు. చెప్పండి: హిందీ, తమిళం, కన్నడ, ఇంగ్లీష్",
+        "hindi":"सुनाई नहीं दिया। कहें: हिंदी, तमिल, कन्नड़, अंग्रेजी",
+        "tamil":"கேட்கவில்லை. சொல்லுங்கள்: ஹிந்தி, தமிழ், கன்னடம், ஆங்கிலம்",
+        "kannada":"ಕೇಳಿಸಲಿಲ್ಲ. ಹೇಳಿ: ಹಿಂದಿ, ತಮಿಳు, ಕನ್ನಡ, ಇಂಗ್ಲಿಷ್",
+        "malayalam":"కేట్టిల్. పరయుక: హింది, తమిళ్, కన్నడ, ఇంగ్లీష్",
+        "english":"Not heard. Say: hindi, tamil, kannada, english",
+    }.get(lang_key, "Not heard. Say: hindi, tamil, kannada, english")
+
+def _lc_not_understood_msg(lang_key: str, supported: str) -> str:
+    """Spoken on a failed (but retryable) language match attempt."""
+    return {
+        "telugu":f"అర్థం కాలేదు. అందుబాటులో: {supported}. మళ్ళీ చెప్పండి",
+        "hindi":f"समझ नहीं आया। उपलब्ध: {supported}। फिर से कहें",
+        "tamil":f"புரியவில்లை. కిడైక్కుం: {supported}. మీణ్డుం సొల్లుంగళ్",
+        "kannada":f"ಅರ್ಥవాగలిల్ల. లభ్యవిరువవు: {supported}. మత్తే హేళి",
+        "malayalam":f"మనస్సిలాయిల్ల. లభ్యమావ: {supported}. వీణ్డుం పరయుక",
+        "english":f"Not understood. Available: {supported}. Say again.",
+    }.get(lang_key, f"Not understood. Available: {supported}. Say again.")
+
+def _lc_give_up_msg(lang_key: str) -> str:
+    """Spoken after all retry attempts for language-change are exhausted."""
+    return {
+        "telugu":"భాష గుర్తించబడలేదు. మళ్ళీ ఆక్టివేట్ చెప్పి ప్రయత్నించండి",
+        "hindi":"भाषा पहचानी नहीं गई। फिर से activate कहकर कोशिश करें",
+        "tamil":"మొழి అడైయాళం కాణప్పడవిల్లై. మీణ్డుం activate సొల్లి ముయర్చిక్కవుం",
+        "kannada":"భాషే గురుతిసలాగలిల్ల. మత్తే activate ఎందు హేళి ప్రయత్నిసి",
+        "malayalam":"భాష తిరిచ్చరిఞ్ఞిల్ల. వీణ్డుం activate ఎన్న్ పరఞ్ఞ్ శ్రమిక్కుక",
+        "english":"Language not recognized. Try activate command again",
+    }.get(lang_key, "Language not recognized. Try activate command again")
 def get_menu_in_current_lang() -> str:
     menus = {
-        "telugu" : ("మీకు ఎనిమిది ఆదేశాలు అందుబాటులో ఉన్నాయి. "
+        "telugu" : ("మీకు పది ఆదేశాలు అందుబాటులో ఉన్నాయి. "
                     "ఒకటి స్థలం సేవ్. రెండు వ్యక్తిని సేవ్. మూడు స్థలానికి వెళ్ళు. "
                     "నాలుగు నావిగేషన్ ఆపు. అయిదు భాష మార్చు. ఆరు టెక్స్ట్ చదువు. "
-                    "ఏడు మెసేజ్ పంపు. ఎనిమిది ఎస్ ఓ ఎస్."),
-        "hindi"  : ("आपके पास आठ आदेश हैं। एक जगह सेव। दो व्यक्ति सेव। "
+                    "ఏడు మెసేజ్ పంపు. ఎనిమిది ఎస్ ఓ ఎస్. తొమ్మిది దృశ్యం చెప్పు. పది ఏఐ మోడ్."),
+        "hindi"  : ("आपके पास दस आदेश हैं। एक जगह सेव। दो व्यक्ति सेव। "
                     "तीन जगह जाओ। चार नेविगेशन बंद। पाँच भाषा बदलो। "
-                    "छह टेक्स्ट पढ़ो। सात संदेश भेजो। आठ एस ओ एस।"),
-        "english": ("You have eight commands. One save place. Two save person. "
+                    "छह टेक्स्ट पढ़ो। सात संदेश भेजो। आठ एस ओ एस। नौ दृश्य बताओ। दस एआई मोड।"),
+        "english": ("You have ten commands. One save place. Two save person. "
                     "Three navigate. Four stop navigation. Five change language. "
-                    "Six read text. Seven send message. Eight S O S."),
+                    "Six read text. Seven send message. Eight S O S. Nine describe scene. Ten AI mode."),
     }
     with _current_lang_lock: key = _current_lang
     return menus.get(key, menus["english"])
@@ -518,9 +684,18 @@ def get_menu_in_current_lang() -> str:
 
 PLACES_DIR = "saved_places"; SAVE_DIR = "saved_faces"; DB_FILE = "face_db.pkl"
 CLIP_CHECK_EVERY=1.5; ORB_MIN_MATCHES=8; ARRIVAL_THRESHOLD=0.82; DEPTH_SCALE=5.0
-YOLO_MODEL="yolov8n.pt"; FRAME_SKIP=4; YOLO_COOLDOWN=4.0; FACE_COOLDOWN=4.0
+NAV_REFERENCE_DISTANCE_M=2.0  # assumed distance (meters) the user stood at when saving a place photo
+YOLO_MODEL="yolov8s.pt"; FRAME_SKIP=4; YOLO_COOLDOWN=4.0; FACE_COOLDOWN=4.0
 CONF_THRESHOLD=0.45; FACE_SCALE=0.5; TOLERANCE=0.50; CAPTURE_PHOTOS=5
 CAPTURE_GAP=0.5; FOCAL_PX=600; SPEAK_COOLDOWN=3.5
+# ── Place-capture tuning (see SAVE PLACE section) ───────────────────
+# More photos spread evenly across a full 360° turn = ORB has a matching
+# reference no matter which side the user approaches from later, and each
+# photo's approximate compass-style bearing (relative to the first shot)
+# is recorded in a per-place meta.json so navigation can fall back on it
+# when ORB match quality is too low to compute a homography.
+SAVE_PLACE_PHOTOS = 8
+SAVE_PLACE_GAP_SECONDS = 2.0
 os.makedirs(PLACES_DIR, exist_ok=True); os.makedirs(SAVE_DIR, exist_ok=True)
 
 VC_LISTEN_START="వింటున్నాను చెప్పండి"; VC_NOT_HEARD="అర్థం కాలేదు మళ్ళీ చెప్పండి"
@@ -539,6 +714,15 @@ VC_CMD_READ_TEXT  =["read text","read","text","scan","ocr","చదువు","�
 VC_CMD_CANCEL_OCR =["cancel","stop","stop reading","ఆపు","స్టాప్","చదవడం ఆపు"]
 VC_CMD_SEND_MSG   =["send message","send sms","message","sms","send a message","text message","మెసేజ్ పంపు","మెసేజ్","సందేశం పంపు","send msg","msg"]
 VC_CMD_SOS        =["sos","s.o.s","s o s","emergency","help me","అత్యవసరం","ఎస్ ఓ ఎస్","emergency help","call for help","అత్యవసర కాల్"]
+VC_CMD_DESCRIBE   =["describe","describe scene","scene","what is around","what's around",
+                     "దృశ్యం చెప్పు","దృశ్యం","వివరించు","చుట్టూ ఏముంది","సీన్ చెప్పు","డిస్క్రైబ్"]
+VC_CMD_CANCEL_DESCRIBE=["cancel","stop","stop describing","ఆపు","స్టాప్","చెప్పడం ఆపు"]
+VC_CMD_AI_MODE    =["ai mode","ai assistant","artificial intelligence mode",
+                     "ఏఐ మోడ్","ఏఐ మోడ"]
+VC_CMD_CANCEL_AI_MODE=["cancel","stop","stop ai","ఆపు","స్టాప్","ఏఐ ఆపు"]
+
+WAKE_WORDS=["listen","command","activate","drishti","assistant",
+            "లిసెన్","వినండి","దృష్టి","కమాండ్","ఆక్టివేట్","విను","లెజెండ్","లీజన్","లిజన్"]
 
 NAV_MSG={"left":"ఎడమవైపు తిరగండి","right":"కుడివైపు తిరగండి","forward":"ముందుకు వెళ్ళండి",
          "arrived":"మీరు గమ్యానికి చేరుకున్నారు","obstacle":"ముందు అడ్డంకి ఉంది జాగ్రత్త"}
@@ -561,13 +745,13 @@ _audio_busy   = threading.Event()
 _vc_running   = threading.Event()  # defined early — speak() needs it
 
 def speak(text: str) -> None:
-    if get_mode() in ("save_face","save_place","listening","send_msg","sos"): return
+    if get_mode() in ("save_face","save_place","listening","send_msg","sos","describe","ai_mode"): return
     if _vc_running.is_set(): return
     global _pending_text
     with _audio_lock: _pending_text = text
 
 def speak_blocking(text: str) -> None:
-    if get_mode() in ("save_face","save_place","listening","send_msg","sos"): return
+    if get_mode() in ("save_face","save_place","listening","send_msg","sos","describe","ai_mode"): return
     if _vc_running.is_set(): return
     asyncio.run(_play_once(text))
 
@@ -836,22 +1020,38 @@ class PlaceDB:
         if not self.root.exists(): return
         for place_dir in sorted(self.root.iterdir()):
             if not place_dir.is_dir(): continue
-            name=place_dir.name; imgs=[]; pils=[]; kps=[]; descs=[]; embs=[]
+            name=place_dir.name; imgs=[]; pils=[]; kps=[]; descs=[]; embs=[]; angles=[]
+            meta_path=place_dir/"meta.json"; meta_by_file={}
+            if meta_path.exists():
+                try:
+                    with open(meta_path,"r",encoding="utf-8") as mf:
+                        for entry in json.load(mf):
+                            meta_by_file[entry.get("file","")]=entry.get("angle_deg",None)
+                except Exception as _me:
+                    print(f"[PlaceDB] '{name}' meta.json read failed: {_me}")
+                    meta_by_file={}
             for img_path in sorted(place_dir.glob("*.jpg")):
                 bgr=cv2.imread(str(img_path))
                 if bgr is None: continue
                 gray=cv2.cvtColor(bgr,cv2.COLOR_BGR2GRAY)
                 pil=Image.fromarray(cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB))
                 kp,desc=_orb.detectAndCompute(gray,None)
-                if desc is not None: kps.append(kp); descs.append(desc)
+                # NOTE: always append (even if desc is None) so kps/descs/angles
+                # stay index-aligned with imgs — orb_direction below skips
+                # None entries but needs the SAME index to map a match back
+                # to the correct reference image (for its true dimensions)
+                # and its recorded bearing angle.
+                kps.append(kp); descs.append(desc)
                 inp=_clip_proc(images=pil,return_tensors="pt")
                 with torch.no_grad():
                     emb=_clip_model.get_image_features(**inp)
                     emb=emb/emb.norm(dim=-1,keepdim=True)
                 embs.append(emb); imgs.append(bgr); pils.append(pil)
+                angles.append(meta_by_file.get(img_path.name))
             if not imgs: continue
             avg_emb=torch.stack(embs).mean(dim=0); avg_emb=avg_emb/avg_emb.norm()
-            self.places[name]={"images":imgs,"pils":pils,"kps":kps,"descs":descs,"avg_emb":avg_emb,"all_embs":embs}
+            self.places[name]={"images":imgs,"pils":pils,"kps":kps,"descs":descs,
+                                "avg_emb":avg_emb,"all_embs":embs,"angles":angles}
             print(f"[PlaceDB] '{name}' — {len(imgs)} images")
         print(f"[PlaceDB] Total: {len(self.places)} places ✅")
     def reload(self): self._load()
@@ -887,6 +1087,290 @@ def _sos_call(to_numbers: list) -> None:
                 print(f"[SOS] Call failed for {number}: {e}")
     except Exception as e:
         print(f"[SOS] Client error: {e}")
+
+# ══════════════════════════════════════════════════════════════════
+# GROQ SCENE DESCRIPTION (ported from scene_loop_groq.py)
+# ══════════════════════════════════════════════════════════════════
+
+def _groq_resize_frame_for_upload(frame, max_width=None):
+    max_width = max_width or GROQ_FRAME_MAX_WIDTH
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame
+    scale = max_width / width
+    new_height = int(height * scale)
+    return cv2.resize(frame, (max_width, new_height), interpolation=cv2.INTER_AREA)
+
+def _groq_frame_to_base64_jpeg(frame, max_width=None, quality=None) -> str:
+    frame = _groq_resize_frame_for_upload(frame, max_width=max_width)
+    success, encoded = cv2.imencode(
+        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality or GROQ_JPEG_QUALITY]
+    )
+    if not success:
+        raise RuntimeError("Failed to encode frame as JPEG")
+    return _b64.b64encode(encoded.tobytes()).decode("utf-8")
+
+def _strip_reasoning_trace(text: str) -> str:
+    """qwen/qwen3.6-27b (used for both describe and OCR) is a reasoning
+    model that emits a <think>...</think> block of internal reasoning
+    before the actual answer. Strip that out so callers only ever see
+    the final answer, not the model's thinking-out-loud."""
+    if not text:
+        return text
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    # If the response got cut off mid-thought (no closing tag), drop
+    # everything from <think> onward as a fallback.
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    return cleaned.strip()
+
+def _describe_with_groq(frame) -> str:
+    """Send a cv2 BGR frame to Groq's vision model, get back Telugu description."""
+    if _groq_client is None:
+        raise RuntimeError("Groq API key not set")
+    base64_image = _groq_frame_to_base64_jpeg(frame)
+    completion = _groq_client.chat.completions.create(
+        model=GROQ_SCENE_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT_TELUGU_SCENE},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            }
+        ],
+        temperature=0.7,
+        max_completion_tokens=GROQ_MAX_OUTPUT_TOKENS,
+        top_p=1,
+        stream=False,
+        timeout=GROQ_TIMEOUT_SECONDS,
+    )
+    text = (completion.choices[0].message.content or "").strip()
+    text = _strip_reasoning_trace(text)
+    if not text:
+        raise RuntimeError("Groq returned empty description")
+    return text
+
+def get_scene_description(frame) -> str:
+    """Try Groq, retry on failure. No local fallback — DRISHTI already has its
+    own TTS pipeline, so we just report a spoken error if Groq is unreachable."""
+    last_error = None
+    for attempt in range(1, GROQ_MAX_RETRIES + 2):
+        try:
+            return _describe_with_groq(frame)
+        except Exception as e:
+            last_error = e
+            print(f"[Describe] Groq attempt {attempt} failed: {e}")
+            if attempt <= GROQ_MAX_RETRIES:
+                time.sleep(GROQ_RETRY_BACKOFF_SECONDS)
+    print(f"[Describe] Groq failed after retries ({last_error})")
+    return ""
+
+# ── describe mode state ─────────────────────────────────────────────
+_describe_stop   = threading.Event()
+_describe_frame  = [None]
+
+def _describe_worker(cap_ref) -> None:
+    """Runs while mode == 'describe'. Captures the *existing* DRISHTI camera
+    frame (no second camera opened), describes it via Groq, speaks Telugu,
+    and repeats every GROQ_DESCRIBE_INTERVAL_SECONDS until _describe_stop is set."""
+    print("[Describe] Worker started")
+    while not _describe_stop.is_set():
+        if get_mode() != "describe":
+            time.sleep(0.1); continue
+        frame = _describe_frame[0]
+        if frame is None:
+            time.sleep(0.2); continue
+        if not GROQ_OK or _groq_client is None:
+            speak_force("దృశ్యం వివరణ సేవ అందుబాటులో లేదు")
+            break
+        description = get_scene_description(frame)
+        if get_mode() != "describe" or _describe_stop.is_set():
+            break
+        if description:
+            print(f"[Describe] {description}")
+            speak_force(description)
+        else:
+            speak_force("దృశ్యం వివరించడం సాధ్యం కాలేదు")
+        # Wait for the interval, but check stop/mode frequently so "cancel" is responsive
+        waited = 0.0
+        while waited < GROQ_DESCRIBE_INTERVAL_SECONDS:
+            if _describe_stop.is_set() or get_mode() != "describe":
+                break
+            time.sleep(0.2); waited += 0.2
+    print("[Describe] Worker stopped")
+
+def start_describe_mode(cap) -> None:
+    _describe_stop.clear()
+    set_mode("describe")
+    threading.Thread(target=_describe_worker, args=(cap,), daemon=True, name="DescribeWorker").start()
+    lang=_current_lang
+    if lang=="english": speak_force("Scene description started. Say cancel to stop.")
+    elif lang=="hindi": speak_force("दृश्य वर्णन शुरू हुआ। रोकने के लिए cancel कहें।")
+    else: speak_force("దృశ్యం చెప్పడం మొదలైంది. ఆపడానికి cancel చెప్పండి.")
+
+def stop_describe_mode() -> None:
+    _describe_stop.set()
+    set_mode("default")
+    lang=_current_lang
+    if lang=="english": speak_force("Scene description stopped.")
+    elif lang=="hindi": speak_force("दृश्य वर्णन बंद हो गया।")
+    else: speak_force("దృశ్యం చెప్పడం ఆపబడింది.")
+    print("[Describe] Mode stopped")
+
+# ══════════════════════════════════════════════════════════════════
+# AI MODE — voice Q&A via Groq Whisper (STT) + gpt-oss-120b (LLM)
+# ══════════════════════════════════════════════════════════════════
+
+AI_MODE_TEXT_MODEL   = "openai/gpt-oss-120b"
+AI_MODE_STT_MODEL    = "whisper-large-v3-turbo"
+
+# ── Wake-word / activation-command STT config ──────────────────────
+# distil-whisper-large-v3-en has been decommissioned by Groq, so wake-word
+# detection uses the same whisper-large-v3-turbo model as AI mode. The real
+# fix for the hallucination problem is WAKE_MIN_RMS below (an actual energy
+# gate), plus WAKE_PROMPT biasing the model toward the words you actually
+# say, rather than swapping models.
+WAKE_STT_MODEL       = "whisper-large-v3-turbo"
+WAKE_MIN_RMS         = 250   # raise (300-500) if it still fires on background noise; lower (150-200) if it misses soft speech
+# Whisper's "prompt" param works best as a natural example of the exact
+# speech you expect — not a bare comma list — because it conditions the
+# decoder on realistic preceding context/style, which is what actually
+# steers it away from hallucinating in the wrong language on short clips.
+WAKE_PROMPT          = "Hey drishti, listen. Activate command mode. Drishti, are you listening."
+
+AI_MODE_RECORD_SECONDS = 5
+AI_MODE_SAMPLE_RATE    = 16000
+AI_MODE_MAX_TOKENS     = 200
+
+AI_MODE_SYSTEM_PROMPT = (
+    "You are a warm, concise voice assistant speaking to a blind or "
+    "low-vision user. Always answer in natural, spoken Telugu, in two or "
+    "three short sentences at most — never write lists, bullet points, "
+    "markdown, or anything that doesn't sound natural read aloud. "
+    "You have no access to the internet, sensors, or live data of any "
+    "kind. If asked about today's weather, news, sports scores, stock "
+    "prices, or anything else that requires real-time information you "
+    "don't have, say honestly in Telugu that you can't check live "
+    "information right now, instead of guessing or making something up. "
+    "If asked about symptoms, medications, dosages, or any medical "
+    "concern, do NOT name specific drugs, brands, or dosages, even common "
+    "over-the-counter ones, and do NOT tell them what to take. Instead, "
+    "gently and warmly tell them in Telugu to speak to a doctor or "
+    "pharmacist, since you can't safely assess their health, allergies, "
+    "or other medications. For everything else — explanations, general "
+    "advice, conversation — answer normally and helpfully in Telugu."
+)
+
+_ai_mode_stop = threading.Event()
+
+def _ai_mode_record_question() -> str:
+    """Records AI_MODE_RECORD_SECONDS from the mic and returns a temp WAV path."""
+    audio=sd.rec(int(AI_MODE_RECORD_SECONDS*AI_MODE_SAMPLE_RATE),
+                 samplerate=AI_MODE_SAMPLE_RATE,channels=1,dtype="int16")
+    sd.wait()
+    fd,path=tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    wav_write(path,AI_MODE_SAMPLE_RATE,audio)
+    return path
+
+def _ai_mode_transcribe(wav_path: str) -> str:
+    if _groq_client is None: return ""
+    last_error=None
+    for attempt in range(1,GROQ_MAX_RETRIES+2):
+        try:
+            with open(wav_path,"rb") as f:
+                result=_groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(wav_path),f.read()),
+                    model=AI_MODE_STT_MODEL,
+                    response_format="text",
+                )
+            return result.strip() if isinstance(result,str) else str(result).strip()
+        except Exception as e:
+            last_error=e
+            print(f"[AIMode] STT attempt {attempt} failed: {e}")
+            if attempt<=GROQ_MAX_RETRIES: time.sleep(GROQ_RETRY_BACKOFF_SECONDS)
+    print(f"[AIMode] STT failed after retries ({last_error})")
+    return ""
+
+def _ai_mode_ask(question: str) -> str:
+    if _groq_client is None:
+        return "క్షమించండి, ఏఐ సేవ అందుబాటులో లేదు."
+    last_error=None
+    for attempt in range(1,GROQ_MAX_RETRIES+2):
+        try:
+            completion=_groq_client.chat.completions.create(
+                model=AI_MODE_TEXT_MODEL,
+                messages=[
+                    {"role":"system","content":AI_MODE_SYSTEM_PROMPT},
+                    {"role":"user","content":question},
+                ],
+                temperature=0.6,
+                max_completion_tokens=AI_MODE_MAX_TOKENS,
+                top_p=1,
+                stream=False,
+                timeout=GROQ_TIMEOUT_SECONDS,
+            )
+            text=(completion.choices[0].message.content or "").strip()
+            if text: return text
+            raise RuntimeError("Groq returned an empty answer")
+        except Exception as e:
+            last_error=e
+            print(f"[AIMode] LLM attempt {attempt} failed: {e}")
+            if attempt<=GROQ_MAX_RETRIES: time.sleep(GROQ_RETRY_BACKOFF_SECONDS)
+    print(f"[AIMode] LLM failed after retries ({last_error})")
+    return "క్షమించండి, సమాధానం దొరకలేదు."
+
+def _ai_mode_worker() -> None:
+    """Runs while mode == 'ai_mode'. Records a question, transcribes it,
+    asks Groq's text model, speaks the answer, then waits for the next
+    question — repeating until _ai_mode_stop is set (voice 'cancel')."""
+    print("[AIMode] Worker started")
+    while not _ai_mode_stop.is_set():
+        if get_mode()!="ai_mode":
+            time.sleep(0.1); continue
+        if not GROQ_OK or _groq_client is None:
+            speak_force("ఏఐ మోడ్ అందుబాటులో లేదు")
+            break
+        speak_force("అడగండి")  # "Ask"
+        wav_path=_ai_mode_record_question()
+        if _ai_mode_stop.is_set() or get_mode()!="ai_mode":
+            try: os.remove(wav_path)
+            except Exception: pass
+            break
+        question=_ai_mode_transcribe(wav_path)
+        try: os.remove(wav_path)
+        except Exception: pass
+        if _ai_mode_stop.is_set() or get_mode()!="ai_mode": break
+        if not question:
+            speak_force("వినబడలేదు మళ్ళీ ప్రయత్నించండి")
+            continue
+        print(f"[AIMode] Heard: {question!r}")
+        answer=_ai_mode_ask(question)
+        if _ai_mode_stop.is_set() or get_mode()!="ai_mode": break
+        print(f"[AIMode] Answer: {answer}")
+        speak_force(answer)
+    print("[AIMode] Worker stopped")
+
+def start_ai_mode(cap) -> None:
+    _ai_mode_stop.clear()
+    set_mode("ai_mode")
+    threading.Thread(target=_ai_mode_worker, daemon=True, name="AIModeWorker").start()
+    lang=_current_lang
+    if lang=="english": speak_force("AI mode started. Ask your question. Say cancel to stop.")
+    elif lang=="hindi": speak_force("एआई मोड शुरू हुआ। अपना सवाल पूछें। रोकने के लिए cancel कहें।")
+    else: speak_force("ఏఐ మోడ్ మొదలైంది. మీ ప్రశ్న అడగండి. ఆపడానికి cancel చెప్పండి.")
+
+def stop_ai_mode() -> None:
+    _ai_mode_stop.set()
+    set_mode("default")
+    lang=_current_lang
+    if lang=="english": speak_force("AI mode stopped.")
+    elif lang=="hindi": speak_force("एआई मोड बंद हो गया।")
+    else: speak_force("ఏఐ మోడ్ ఆపబడింది.")
+    print("[AIMode] Mode stopped")
 
 # ══════════════════════════════════════════════════════════════════
 # DIGIT-BY-DIGIT PHONE NUMBER COLLECTION
@@ -1070,6 +1554,114 @@ def _handle_sos(recognizer, src) -> None:
 
 _vc_queue=queue.Queue(); _vc_stop=threading.Event()
 
+# ── UNIVERSAL EARPHONE-BUTTON + 'J' KEY ACTIVATION ──────────────────
+# Different earphones report different subsets of media-key names when
+# their button is pressed (some send 'next track', some 'play/pause
+# media', some the volume keys) — but EVERY earphone sends at least ONE
+# of the names in _MEDIA_KEY_NAMES below. So instead of requiring a
+# specific double/triple-click pattern (which only worked on one tested
+# model), a SINGLE press of ANY of these now triggers activation —
+# making this work across brands/models without per-device tuning.
+# The 'j' key on a regular PC keyboard does the exact same thing, so
+# activation also works with no earphone at all.
+_manual_activate_pending = threading.Event()
+_LAST_HOTKEY_TRIGGER_TIME = [0.0]
+_HOTKEY_COOLDOWN_SECONDS  = 2.0   # debounce: ignore repeat events from one physical press
+_hotkey_debounce_lock = threading.Lock()
+
+_MEDIA_KEY_NAMES = {
+    "next track", "previous track", "volume up", "volume down",
+    "play/pause media", "play", "pause", "stop media", "media play pause",
+}
+
+def _trigger_manual_activation(source: str) -> None:
+    now = time.time()
+    with _hotkey_debounce_lock:
+        if now - _LAST_HOTKEY_TRIGGER_TIME[0] < _HOTKEY_COOLDOWN_SECONDS:
+            return
+        _LAST_HOTKEY_TRIGGER_TIME[0] = now
+    print(f"[Hotkey] {source} — manual activation triggered")
+    _manual_activate_pending.set()
+
+def _hotkey_key_event_callback(event) -> None:
+    """Generic key-event handler (not on_press_key) — some earphone
+    buttons use scan codes on_press_key's internal name-lookup table
+    doesn't recognize, so every key event is hooked directly and
+    event.name is checked manually. ANY single press of ANY known media
+    key, OR the 'j' key, triggers activation."""
+    if getattr(event, "event_type", None) != "down":
+        return
+    name = (event.name or "").lower()
+    if name in _MEDIA_KEY_NAMES:
+        _trigger_manual_activation(f"Earphone button ('{name}')")
+    elif name == "j":
+        _trigger_manual_activation("'J' key")
+
+def _hotkey_watcher_thread() -> None:
+    """Hooks ALL key events (generic hook — see _hotkey_key_event_callback
+    for why) and triggers activation on a single press of any recognized
+    earphone media button OR the 'j' key — a fallback activation path
+    that doesn't depend on the wake word being heard at all. Requires the
+    'keyboard' library; no-ops silently if missing or if hooking fails."""
+    if not KEYBOARD_OK:
+        return
+    try:
+        _kb.hook(_hotkey_key_event_callback)
+        print("[Hotkey] Watching for ANY single earphone button press "
+              "(next/prev track, volume up/down, play/pause) OR the 'J' "
+              "key — either instantly activates command mode...")
+    except Exception as e:
+        print(f"[Hotkey] Failed to install key hook: {e}")
+        return
+    while not _vc_stop.is_set():
+        time.sleep(0.5)
+
+def _activate_and_listen_for_command(recognizer, src, wake_text: str) -> None:
+    """Shared 'command mode is now active, listen for the actual command'
+    flow. Used both when a real wake word is heard (wake_text passed in)
+    and when the earphone button / 'j' key fallback fires (wake_text="",
+    which skips straight to prompting + listening for the command)."""
+    global _pending_text
+    _vc_running.set(); set_mode("listening")
+    with _audio_lock: _pending_text=None
+    try:
+        if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
+    except Exception: pass
+    time.sleep(0.1)
+    print("[VoiceCmd] ✅ Activated! Command mode active.")
+    try:
+        inline=wake_text
+        for w in WAKE_WORDS: inline=inline.replace(w,"")
+        inline=inline.strip()
+        INLINE_KEYWORDS=["save","navigate","where","stop","change","language",
+                          "place","person","face","quit","message","sms","sos","emergency",
+                          "describe","scene","ai mode","ai assistant"]
+        is_real_cmd=any(kw in inline for kw in INLINE_KEYWORDS)
+        if inline and len(inline)>4 and is_real_cmd:
+            print(f"[VoiceCmd] Inline: '{inline}'")
+            _process_vc_command(inline,src,recognizer)
+        else:
+            speak_force(VC_LISTEN_START)
+            try:
+                audio2=recognizer.listen(src,timeout=7,phrase_time_limit=6)
+                cmd_text=_recognize_audio_wake(recognizer,audio2)
+                if not cmd_text: cmd_text=_recognize_audio(recognizer,audio2)
+            except Exception: cmd_text=""
+            print(f"[VoiceCmd] Command: '{cmd_text}'")
+            if cmd_text:
+                if any(w in cmd_text for w in ["menu","help","commands","list","మెను","మెనూ","సహాయం","హెల్ప్"]):
+                    speak_force(get_menu_in_current_lang())
+                else:
+                    _process_vc_command(cmd_text,src,recognizer)
+            else:
+                speak_force(VC_NOT_HEARD)
+    except Exception as e:
+        print(f"[VoiceCmd] Error: {e}"); speak_force(VC_NOT_HEARD)
+    finally:
+        if _vc_running.is_set(): _vc_running.clear()
+        if get_mode()=="listening": set_mode("default")
+        print("[VoiceCmd] Done — back to idle\n")
+
 def _match_cmd(text,keywords):
     t=text.lower(); return any(k.lower() in t for k in keywords)
 
@@ -1090,9 +1682,62 @@ def _recognize_audio_wake(recognizer,audio):
         except Exception: continue
     return ""
 
+def _recognize_audio_wake_groq(audio) -> str:
+    """distil-whisper-large-v3-en based wake-word recognition. Faster than
+    whisper-large-v3-turbo and — per Groq's own benchmarks — much less
+    prone to hallucinating text on weak/near-silent audio, which is what
+    was causing repeated garbage transcriptions instead of real wake-word
+    detections. English-only, which covers 'listen', 'command', 'activate',
+    'drishti', 'assistant'. Falls back to empty string (caller already
+    handles that) if Groq is unavailable, the clip has no real speech
+    energy, or the call fails — never raises."""
+    if _groq_client is None: return ""
+
+    # ── Reject clips with no real speech energy BEFORE calling the API.
+    # This is what was letting faint ambient/room noise through to Whisper,
+    # which then hallucinated fluent-sounding but wrong text (e.g. random
+    # Hindi) instead of returning nothing.
+    raw = audio.get_raw_data()
+    try:
+        rms = audioop.rms(raw, audio.sample_width)
+    except Exception:
+        rms = 9999  # fail open rather than silently blocking real speech
+    if rms < WAKE_MIN_RMS:
+        return ""
+    # ─────────────────────────────────────────────────────────────────
+
+    fd,path=tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    try:
+        with open(path,"wb") as f:
+            f.write(audio.get_wav_data())
+        with open(path,"rb") as f:
+            result=_groq_client.audio.transcriptions.create(
+                file=(os.path.basename(path),f.read()),
+                model=WAKE_STT_MODEL,
+                response_format="text",
+                prompt=WAKE_PROMPT,
+                language="en",
+            )
+        text=result.strip() if isinstance(result,str) else str(result).strip()
+        return text.lower()
+    except Exception as e:
+        print(f"[VoiceCmd] Groq wake STT failed: {e}")
+        return ""
+    finally:
+        try: os.remove(path)
+        except Exception: pass
+
 def _listen_once(recognizer,src,timeout=7):
+    """Used only for capturing person/place NAMES. Always tries English
+    recognition first regardless of the current spoken-output language,
+    so names are saved as 'naga prasanth' rather than Telugu/Hindi script."""
     try:
         audio=recognizer.listen(src,timeout=timeout,phrase_time_limit=6)
+        for lng in ("en-IN","en-US"):
+            try:
+                result=recognizer.recognize_google(audio,language=lng)
+                if result: return result.lower()
+            except Exception: continue
         return _recognize_audio(recognizer,audio)
     except Exception: return ""
 
@@ -1102,21 +1747,64 @@ def _voice_command_thread() -> None:
     recognizer=sr.Recognizer()
     recognizer.energy_threshold=400; recognizer.dynamic_energy_threshold=True
     recognizer.pause_threshold=0.6; mic=sr.Microphone()
-    WAKE_WORDS=["listen","command","activate","drishti","assistant",
-                "లిసెన్","వినండి","దృష్టి","కమాండ్","ఆక్టివేట్","విను","లెజెండ్","లీజన్","లిజన్"]
     with mic as src:
         print("[VoiceCmd] Calibrating for 2 seconds — stay quiet...")
         recognizer.adjust_for_ambient_noise(src,duration=2)
         ambient=recognizer.energy_threshold
-        recognizer.energy_threshold=max(300,min(800,ambient*3.0))
+        # ── EARPHONE-TUNED THRESHOLDS ─────────────────────────────
+        # With earphones there is effectively zero acoustic bleed from
+        # DRISHTI's own TTS output back into the mic, so we can afford a
+        # LOWER, more sensitive threshold than the old speaker-tuned values
+        # (which had to be set high/loose to reject speaker bleed). This
+        # makes short words like "listen" register more reliably.
+        # If you switch back to speakers, raise these back to
+        # max(300,min(800,ambient*3.0)) and pause_threshold=0.6 or higher.
+        recognizer.energy_threshold=max(120,min(280,ambient*1.3))
         recognizer.dynamic_energy_threshold=False
-        recognizer.pause_threshold=0.5; recognizer.non_speaking_duration=0.4
-        print(f"[VoiceCmd] Mic ready. Threshold={recognizer.energy_threshold:.0f}")
+        recognizer.pause_threshold=0.6; recognizer.non_speaking_duration=0.4
+        # ───────────────────────────────────────────────────────────
+        print(f"[VoiceCmd] Mic ready. Threshold={recognizer.energy_threshold:.0f}  (earphone-tuned)")
         print("[VoiceCmd] Say 'listen' to activate commands.")
         while not _vc_stop.is_set():
-            try: audio=recognizer.listen(src,timeout=None,phrase_time_limit=3)
-            except Exception: time.sleep(0.1); continue
+            if pygame.mixer.music.get_busy():
+                time.sleep(0.1); continue
+            # ── EARPHONE BUTTON / 'J' KEY FALLBACK ──────────────────
+            # A short (1s) timeout instead of blocking forever lets this
+            # loop wake up regularly even in total silence, so it can
+            # notice _manual_activate_pending (set by ANY single earphone
+            # button press or the 'j' key, from _hotkey_watcher_thread)
+            # and jump straight into command mode without "listen"
+            # needing to be heard/understood at all.
+            try:
+                audio=recognizer.listen(src,timeout=1.0,phrase_time_limit=6)
+            except sr.WaitTimeoutError:
+                if _manual_activate_pending.is_set():
+                    _manual_activate_pending.clear()
+                    _activate_and_listen_for_command(recognizer,src,"")
+                continue
+            except Exception:
+                time.sleep(0.1); continue
+            if _manual_activate_pending.is_set():
+                _manual_activate_pending.clear()
+                _activate_and_listen_for_command(recognizer,src,"")
+                continue
+            # ─────────────────────────────────────────────────────────
+            if pygame.mixer.music.get_busy(): continue
+            # ── Reject too-short/near-silent clips BEFORE sending to Whisper.
+            # This is what was causing hallucinated garbage output (e.g. random
+            # Japanese text) on quiet/near-empty audio segments — Whisper-family
+            # models are known to hallucinate fluent-sounding but wrong text when
+            # given very short or low-energy input instead of real speech.
+            raw_data = audio.get_raw_data()
+            if len(raw_data) < 9000:  # roughly <0.28s of 16-bit mono @16kHz
+                continue
+            # ─────────────────────────────────────────────────────────
+            # Google first — it tends to return "" on unclear audio rather
+            # than confidently inventing wrong words like Whisper does.
+            # Groq is now just a backup if Google gets nothing at all.
             wake_text=_recognize_audio_wake(recognizer,audio)
+            if not wake_text and GROQ_OK and _groq_client:
+                wake_text=_recognize_audio_wake_groq(audio)
             if not wake_text: continue
             print(f"[VoiceCmd] Heard: '{wake_text}'")
             if _match_cmd(wake_text,VC_CMD_SOS):
@@ -1137,48 +1825,15 @@ def _voice_command_thread() -> None:
                 _vc_queue.put(("vc_stop_ocr","")); continue
             if get_mode()=="nav" and any(w in wake_text for w in ["cancel","stop","ఆపు","స్టాప్"]):
                 _vc_queue.put(("vc_stop_nav","")); continue
+            if get_mode()=="describe" and any(w in wake_text for w in ["cancel","stop","ఆపు","స్టాప్"]):
+                _vc_queue.put(("vc_stop_describe","")); continue
+            if get_mode()=="ai_mode" and any(w in wake_text for w in ["cancel","stop","ఆపు","స్టాప్"]):
+                _vc_queue.put(("vc_stop_ai_mode","")); continue
             words_heard=wake_text.lower().split()
             triggered=any(w in wake_text for w in WAKE_WORDS) or \
                       any(w in words_heard for w in ["command","activate","mode","listen"])
             if not triggered: continue
-            _vc_running.set(); set_mode("listening")
-            with _audio_lock: _pending_text=None
-            try:
-                if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
-            except Exception: pass
-            time.sleep(0.1)
-            print("[VoiceCmd] ✅ Wake word! Command mode active.")
-            try:
-                inline=wake_text
-                for w in WAKE_WORDS: inline=inline.replace(w,"")
-                inline=inline.strip()
-                INLINE_KEYWORDS=["save","navigate","where","stop","change","language",
-                                  "place","person","face","quit","message","sms","sos","emergency"]
-                is_real_cmd=any(kw in inline for kw in INLINE_KEYWORDS)
-                if inline and len(inline)>4 and is_real_cmd:
-                    print(f"[VoiceCmd] Inline: '{inline}'")
-                    _process_vc_command(inline,src,recognizer)
-                else:
-                    speak_force(VC_LISTEN_START)
-                    try:
-                        audio2=recognizer.listen(src,timeout=7,phrase_time_limit=6)
-                        cmd_text=_recognize_audio_wake(recognizer,audio2)
-                        if not cmd_text: cmd_text=_recognize_audio(recognizer,audio2)
-                    except Exception: cmd_text=""
-                    print(f"[VoiceCmd] Command: '{cmd_text}'")
-                    if cmd_text:
-                        if any(w in cmd_text for w in ["menu","help","commands","list","మెను","మెనూ","సహాయం","హెల్ప్"]):
-                            speak_force(get_menu_in_current_lang())
-                        else:
-                            _process_vc_command(cmd_text,src,recognizer)
-                    else:
-                        speak_force(VC_NOT_HEARD)
-            except Exception as e:
-                print(f"[VoiceCmd] Error: {e}"); speak_force(VC_NOT_HEARD)
-            finally:
-                if _vc_running.is_set(): _vc_running.clear()
-                if get_mode()=="listening": set_mode("default")
-                print("[VoiceCmd] Done — back to idle\n")
+            _activate_and_listen_for_command(recognizer,src,wake_text)
 
 def _process_vc_command(text,src,recognizer):
     print(f"[VoiceCmd] Processing: '{text}'")
@@ -1186,6 +1841,10 @@ def _process_vc_command(text,src,recognizer):
         speak_force(VC_GOODBYE); _vc_queue.put(("quit","")); return
     if get_mode()=="ocr" and _match_cmd(text,VC_CMD_CANCEL_OCR):
         _vc_queue.put(("vc_stop_ocr","")); return
+    if get_mode()=="describe" and _match_cmd(text,VC_CMD_CANCEL_DESCRIBE):
+        _vc_queue.put(("vc_stop_describe","")); return
+    if get_mode()=="ai_mode" and _match_cmd(text,VC_CMD_CANCEL_AI_MODE):
+        _vc_queue.put(("vc_stop_ai_mode","")); return
     if _match_cmd(text,VC_CMD_SOS):
         _handle_sos(recognizer,src); return
     if _match_cmd(text,VC_CMD_SEND_MSG):
@@ -1236,8 +1895,9 @@ def _process_vc_command(text,src,recognizer):
                 else: speak_force("స్థలం అర్థం కాలేదు. మళ్ళీ కమాండ్ ఇవ్వండి")
         return
     if _match_cmd(text,VC_CMD_CHANGE_LANG):
+        _lang_before=_current_lang
         lang_list=", ".join(SUPPORTED_LANGUAGES.keys())
-        speak_force(f"ఏ భాషకు మార్చాలి? అందుబాటులో: {lang_list}")
+        speak_force(_lc_ask_prompt(_lang_before,lang_list))
         lang_key=""; attempts=0
         try:
             audio_lang=recognizer.listen(src,timeout=7,phrase_time_limit=5)
@@ -1260,17 +1920,20 @@ def _process_vc_command(text,src,recognizer):
                         except Exception: continue
                 except Exception: lang_text=""
             print(f"[VoiceCmd] Language heard: '{lang_text}'")
-            if not lang_text: speak_force("Not heard. Say: hindi, tamil, kannada, english"); continue
+            if not lang_text: speak_force(_lc_not_heard_msg(_lang_before)); continue
             lang_key=detect_language_from_text(lang_text)
             if lang_key: set_language(lang_key); speak_force(get_lang_changed_msg(lang_key))
             else:
                 remaining=3-attempts
-                supported="telugu, hindi, tamil, kannada, malayalam, english"
-                if remaining>0: speak_force(f"Not understood. Available: {supported}. Say again.")
-                else: speak_force("Language not recognized. Try activate command again")
+                if remaining>0: speak_force(_lc_not_understood_msg(_lang_before,lang_list))
+                else: speak_force(_lc_give_up_msg(_lang_before))
         return
     if _match_cmd(text,VC_CMD_READ_TEXT):
         _vc_queue.put(("vc_start_ocr","")); return
+    if _match_cmd(text,VC_CMD_DESCRIBE):
+        _vc_queue.put(("vc_start_describe","")); return
+    if _match_cmd(text,VC_CMD_AI_MODE):
+        _vc_queue.put(("vc_start_ai_mode","")); return
     print(f"[VoiceCmd] → NO MATCH for: '{text}'")
     speak_force(VC_NOT_HEARD)
 
@@ -1303,77 +1966,94 @@ def _fuzzy_match_place(text):
     return best_name
 
 # ══════════════════════════════════════════════════════════════════
-# OCR ENGINE
+# OCR ENGINE (Groq-powered — replaces EasyOCR, which was misreading text)
 # ══════════════════════════════════════════════════════════════════
 
 _ocr_reader=None; _ocr_reader_lock=threading.Lock(); _ocr_active=threading.Event()
 _ocr_last_text=""; _ocr_last_time=0.0; _ocr_frame=[None]; _ocr_stop_flag=threading.Event()
 
-def _init_ocr_reader():
-    global _ocr_reader
-    with _ocr_reader_lock:
-        if _ocr_reader is None:
-            try:
-                import easyocr
-                print("[OCR] Loading EasyOCR model (first time ~30s)...")
-                _ocr_reader=easyocr.Reader(["en","te"],gpu=False)
-                print("[OCR] EasyOCR ready (en+Telugu) ✅")
-            except ImportError:
-                print("[OCR] easyocr not installed. Run: pip install easyocr")
-                _ocr_reader=None
-    return _ocr_reader
+OCR_FRAME_MAX_WIDTH = 800   # sharper than the describe feature's 480px — small text needs more detail
+OCR_JPEG_QUALITY    = 85    # higher quality than describe's 70 — less compression blur on text
 
-def _detect_text_accurate(frame_bgr):
-    reader=_ocr_reader
-    if reader is None: return []
-    try:
-        h,w=frame_bgr.shape[:2]
-        if w<960: frame_bgr=cv2.resize(frame_bgr,(int(w*960/w),int(h*960/w)),interpolation=cv2.INTER_CUBIC)
-        elif w>1280: frame_bgr=cv2.resize(frame_bgr,(1280,int(h*1280/w)))
-        all_results=[]
-        rgb_orig=cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2RGB)
+PROMPT_OCR_READ = (
+    "You are a pure OCR engine, not an assistant. Your only job is to copy "
+    "characters exactly as they visually appear in the image, in their "
+    "original language and script.\n"
+    "STRICT RULES:\n"
+    "- Do NOT answer any question that the text might be asking.\n"
+    "- Do NOT explain, summarize, complete, or continue the text.\n"
+    "- Do NOT add any word that is not visually present in the image.\n"
+    "- If a word or letter is unclear or blurry, guess the most visually "
+    "similar characters — never substitute a different, more 'sensible' "
+    "word or sentence based on what the text seems to be about.\n"
+    "- Output ONLY the transcribed characters, nothing else — no preamble, "
+    "no translation, no commentary.\n"
+    "- If there is no readable text at all, respond with exactly: NO_TEXT"
+)
+
+def _init_ocr_reader():
+    """Kept for compatibility with the rest of the file (same name/contract as
+    before). No local model to load anymore — Groq is checked at call time."""
+    return _groq_client
+
+def _read_text_with_groq(frame_bgr) -> str:
+    """Groq-based replacement for EasyOCR. Uses a sharper/higher-quality
+    image than the describe feature, since small text needs more detail
+    than a general scene description does."""
+    if _groq_client is None:
+        raise RuntimeError("Groq API key not set")
+    base64_image = _groq_frame_to_base64_jpeg(frame_bgr, max_width=OCR_FRAME_MAX_WIDTH, quality=OCR_JPEG_QUALITY)
+    completion = _groq_client.chat.completions.create(
+        model=GROQ_SCENE_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT_OCR_READ},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            }
+        ],
+        temperature=0.0,
+        max_completion_tokens=GROQ_MAX_OUTPUT_TOKENS,
+        top_p=1,
+        stream=False,
+        timeout=GROQ_TIMEOUT_SECONDS,
+    )
+    text = (completion.choices[0].message.content or "").strip()
+    text = _strip_reasoning_trace(text)
+    return text
+
+def _detect_text_accurate(frame_bgr) -> str:
+    """Returns the read text (or "" if none/failed). Name kept for
+    compatibility with the rest of the file."""
+    if not GROQ_OK or _groq_client is None:
+        return ""
+    last_error=None
+    for attempt in range(1, GROQ_MAX_RETRIES + 2):
         try:
-            res1=reader.readtext(rgb_orig,detail=1,paragraph=False,width_ths=0.5,height_ths=0.3,
-                                 contrast_ths=0.05,adjust_contrast=0.7,batch_size=4,min_size=10)
-            all_results.extend(res1)
-        except Exception as e: print(f"[OCR] Pass1: {e}")
-        gray=cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2GRAY)
-        clahe=cv2.createCLAHE(clipLimit=3.0,tileGridSize=(8,8))
-        enhanced=clahe.apply(gray)
-        kernel=np.array([[0,-1,0],[-1,5,-1],[0,-1,0]],dtype=np.float32)
-        sharpened=cv2.filter2D(enhanced,-1,kernel)
-        rgb_enh=cv2.cvtColor(sharpened,cv2.COLOR_GRAY2RGB)
-        try:
-            res2=reader.readtext(rgb_enh,detail=1,paragraph=False,width_ths=0.5,height_ths=0.3,
-                                 contrast_ths=0.05,adjust_contrast=0.5,batch_size=4,min_size=10)
-            all_results.extend(res2)
-        except Exception as e: print(f"[OCR] Pass2: {e}")
-        seen_texts={}
-        for item in all_results:
-            if len(item)==3: box,text,conf=item
-            elif len(item)==2: box,text=item; conf=1.0
-            else: continue
-            text=text.strip()
-            if not text or len(text)<2: continue
-            key=text.lower().replace(" ","")
-            if key not in seen_texts or conf>seen_texts[key][1]:
-                seen_texts[key]=(text,conf,box)
-        return [(t,c,b) for t,c,b in seen_texts.values() if c>0.25]
-    except Exception as e:
-        print(f"[OCR] Error: {e}"); return []
+            text=_read_text_with_groq(frame_bgr)
+            if not text or text.strip().upper()=="NO_TEXT": return ""
+            return text
+        except Exception as e:
+            last_error=e
+            print(f"[OCR] Groq attempt {attempt} failed: {e}")
+            if attempt<=GROQ_MAX_RETRIES: time.sleep(GROQ_RETRY_BACKOFF_SECONDS)
+    print(f"[OCR] Groq failed after retries ({last_error})")
+    return ""
 
 def _ocr_worker_thread(cap_ref):
     global _ocr_last_text,_ocr_last_time
-    print("[OCR] Worker started"); _init_ocr_reader()
+    print("[OCR] Worker started (Groq)")
     while not _ocr_stop_flag.is_set():
         if not _ocr_active.is_set(): time.sleep(0.2); continue
         frame=_ocr_frame[0]
         if frame is None: time.sleep(0.2); continue
-        results=_detect_text_accurate(frame)
-        if not results: time.sleep(2.0); continue
-        results.sort(key=lambda r:r[2][0][1])
-        all_text=" ".join([t for t,c,b in results if c>0.4]).strip()
-        if not all_text: time.sleep(2.0); continue
+        all_text=_detect_text_accurate(frame)
+        if not all_text: time.sleep(3.0); continue
         now=time.time()
         if all_text!=_ocr_last_text:
             _ocr_last_text=all_text; _ocr_last_time=now
@@ -1382,7 +2062,7 @@ def _ocr_worker_thread(cap_ref):
             if lang=="telugu": speak(f"టెక్స్ట్: {all_text}")
             elif lang=="hindi": speak(f"टेक्स्ट: {all_text}")
             else: speak(f"Text: {all_text}")
-        time.sleep(3.0)
+        time.sleep(4.0)
     print("[OCR] Worker stopped")
 
 def start_ocr_mode(cap):
@@ -1411,20 +2091,48 @@ DB = PlaceDB(PLACES_DIR)
 # ══════════════════════════════════════════════════════════════════
 
 def _do_save_place(cap,place_name):
+    """Captures SAVE_PLACE_PHOTOS photos spread across a full 360° turn
+    instead of 5 photos taken from roughly one spot. This gives ORB/CLIP a
+    matching reference photo no matter which direction the user later
+    approaches from, which is the main thing that was making navigation
+    direction unreliable. Each photo's approximate bearing (relative to
+    the very first photo, assuming a roughly steady turning speed) is
+    recorded in a per-place meta.json sidecar — orb_direction() below uses
+    that angle as a fallback hint when the live ORB match is too weak to
+    compute a full homography."""
     place_dir=os.path.join(PLACES_DIR,place_name); os.makedirs(place_dir,exist_ok=True)
-    existing=len([f for f in os.listdir(place_dir) if f.endswith(".jpg")])
-    print(f"\n[SavePlace] Capturing 5 photos of '{place_name}'")
-    speak_blocking(f"{place_name} స్థలం నమోదు మొదలవుతుంది కెమెరా చుట్టూ తిప్పండి")
+    existing_files=[f for f in os.listdir(place_dir) if f.endswith(".jpg")]
+    existing=len(existing_files)
+    meta_path=os.path.join(place_dir,"meta.json")
+    meta=[]
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path,"r",encoding="utf-8") as f: meta=json.load(f)
+        except Exception: meta=[]
+    print(f"\n[SavePlace] Capturing {SAVE_PLACE_PHOTOS} photos of '{place_name}' — rotate slowly in a full circle")
+    speak_blocking(f"{place_name} స్థలం నమోదు మొదలవుతుంది. మీరు నెమ్మదిగా ఒక పూర్తి వృత్తంలో తిరగండి")
     saved=0
-    for i in range(5):
-        print(f"[SavePlace] Photo {i+1}/5 in 2 seconds..."); time.sleep(2)
+    angle_step=360.0/SAVE_PLACE_PHOTOS
+    for i in range(SAVE_PLACE_PHOTOS):
+        print(f"[SavePlace] Photo {i+1}/{SAVE_PLACE_PHOTOS} in {SAVE_PLACE_GAP_SECONDS:.0f}s...")
+        if i>0:
+            speak_blocking("కొద్దిగా తిరగండి")  # "turn a little"
+        time.sleep(SAVE_PLACE_GAP_SECONDS)
         ret,frame=cap.read()
         if not ret: continue
-        path=os.path.join(place_dir,f"{existing+i}.jpg"); cv2.imwrite(path,frame); saved+=1
+        fname=f"{existing+i}.jpg"
+        path=os.path.join(place_dir,fname); cv2.imwrite(path,frame); saved+=1
+        angle_deg=round(((existing+i)*angle_step)%360.0,1)
+        meta.append({"file":fname,"angle_deg":angle_deg,"order":existing+i})
         flash=frame.copy()
-        cv2.putText(flash,f"Saving Place: {place_name}  {i+1}/5",(10,60),cv2.FONT_HERSHEY_SIMPLEX,1.2,(0,255,0),3)
+        cv2.putText(flash,f"Saving Place: {place_name}  {i+1}/{SAVE_PLACE_PHOTOS}  (~{angle_deg:.0f}deg)",
+                    (10,60),cv2.FONT_HERSHEY_SIMPLEX,1.0,(0,255,0),3)
         cv2.imshow("DRISHTI",flash); cv2.waitKey(200)
-    print(f"[SavePlace] Done — {saved}/5 photos saved for '{place_name}'")
+    try:
+        with open(meta_path,"w",encoding="utf-8") as f: json.dump(meta,f,ensure_ascii=False,indent=2)
+    except Exception as e:
+        print(f"[SavePlace] Could not write meta.json: {e}")
+    print(f"[SavePlace] Done — {saved}/{SAVE_PLACE_PHOTOS} photos saved for '{place_name}'")
     DB.reload(); speak_blocking(f"{place_name} స్థలం సేవ్ అయింది")
 
 def _save_place_thread(cap,place_name):
@@ -1456,22 +2164,27 @@ def clip_similarity(frame_bgr,dest_name):
 # ══════════════════════════════════════════════════════════════════
 
 def orb_direction(frame_bgr,dest_name):
-    result={"direction":"forward","offset_x":0,"offset_y":0,"arrow_dst":None,"n_matches":0,"confidence":0.0}
+    result={"direction":"forward","offset_x":0,"offset_y":0,"arrow_dst":None,"n_matches":0,
+            "confidence":0.0,"scale":0.0,"matched_angle":None,"matched_idx":-1}
     gray=cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2GRAY)
     kp_cur,desc_cur=_orb.detectAndCompute(gray,None)
     if desc_cur is None or len(desc_cur)<5: return result
     place=DB.places[dest_name]; h,w=frame_bgr.shape[:2]; cx,cy=w//2,h//2
-    best_matches=[]; best_ref_kps=None
-    for ref_desc,ref_kps in zip(place["descs"],place["kps"]):
+    best_matches=[]; best_ref_kps=None; best_idx=-1
+    for idx,(ref_desc,ref_kps) in enumerate(zip(place["descs"],place["kps"])):
         if ref_desc is None or len(ref_desc)<5: continue
         try:
             raw=_matcher.match(desc_cur,ref_desc)
             good=sorted(raw,key=lambda m:m.distance)[:50]
             good=[m for m in good if m.distance<60]
-            if len(good)>len(best_matches): best_matches=good; best_ref_kps=ref_kps
+            if len(good)>len(best_matches): best_matches=good; best_ref_kps=ref_kps; best_idx=idx
         except Exception: continue
     result["n_matches"]=len(best_matches)
     if len(best_matches)<ORB_MIN_MATCHES or best_ref_kps is None: return result
+    result["matched_idx"]=best_idx
+    angles=place.get("angles",[])
+    if 0<=best_idx<len(angles) and angles[best_idx] is not None:
+        result["matched_angle"]=angles[best_idx]
     result["confidence"]=min(1.0,len(best_matches)/40.0)
     pts_cur=np.float32([kp_cur[m.queryIdx].pt for m in best_matches]).reshape(-1,1,2)
     pts_ref=np.float32([best_ref_kps[m.trainIdx].pt for m in best_matches]).reshape(-1,1,2)
@@ -1481,13 +2194,31 @@ def orb_direction(frame_bgr,dest_name):
         result["offset_x"]=offset_x
         result["direction"]="left" if offset_x<-30 else ("right" if offset_x>30 else "forward")
         result["arrow_dst"]=(int(np.mean(pts_cur[:,0,0])),cy); return result
-    ref_h2,ref_w2=DB.places[dest_name]["images"][0].shape[:2]
+    # FIX: use the dimensions of the ref image that actually matched best
+    # (best_idx), not always images[0] — mixing dimensions from a
+    # different reference photo than the one used for the homography was
+    # throwing off the projected centre point when place photos weren't
+    # all identical resolution.
+    ref_h2,ref_w2=place["images"][best_idx].shape[:2]
     ref_centre=np.float32([[ref_w2/2,ref_h2/2]]).reshape(-1,1,2)
     try: proj=cv2.perspectiveTransform(ref_centre,H); px,py=int(proj[0,0,0]),int(proj[0,0,1])
     except Exception: px,py=cx,cy
     offset_x=px-cx; offset_y=py-cy
     result["offset_x"]=offset_x; result["offset_y"]=offset_y
     result["arrow_dst"]=(max(30,min(w-30,px)),max(30,min(h-30,py)))
+    # ── Scale factor from the homography: how much bigger/smaller the
+    # reference image appears in the live frame. >1 means the destination's
+    # features appear larger now (closer); <1 means smaller (farther).
+    # Used by estimate_depth_at() below as a MiDaS-free distance estimate.
+    try:
+        ref_corners=np.float32([[0,0],[ref_w2,0],[ref_w2,ref_h2],[0,ref_h2]]).reshape(-1,1,2)
+        proj_corners=cv2.perspectiveTransform(ref_corners,H)
+        ref_diag=float(np.hypot(ref_w2,ref_h2))
+        proj_diag=float(np.hypot(proj_corners[2,0,0]-proj_corners[0,0,0],
+                                  proj_corners[2,0,1]-proj_corners[0,0,1]))
+        result["scale"]=proj_diag/ref_diag if ref_diag>1e-6 else 0.0
+    except Exception:
+        result["scale"]=0.0
     THRESH=w*0.12
     if abs(offset_x)<THRESH and abs(offset_y)<THRESH*0.8: result["direction"]="forward"
     elif offset_x<-THRESH: result["direction"]="left"
@@ -1495,18 +2226,18 @@ def orb_direction(frame_bgr,dest_name):
     else: result["direction"]="forward"
     return result
 
-def estimate_depth_at(frame_bgr,x,y):
-    if not MIDAS_OK: return -1.0
-    try:
-        rgb=cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2RGB); inp=_midas_xfm(rgb)
-        with torch.no_grad():
-            pred=_midas(inp)
-            pred=torch.nn.functional.interpolate(pred.unsqueeze(1),size=frame_bgr.shape[:2],
-                                                 mode="bicubic",align_corners=False).squeeze()
-        dm=pred.cpu().numpy()
-        raw=float(dm[max(0,min(dm.shape[0]-1,y)),max(0,min(dm.shape[1]-1,x))])
-        return round(DEPTH_SCALE/(raw/dm.max()+1e-6),1)
-    except Exception: return -1.0
+def estimate_depth_at(scale: float) -> float:
+    """Math-based distance estimate, replacing MiDaS (which fails on this
+    machine with WinError 6). Uses the homography scale factor from
+    orb_direction: the destination's saved reference photo was taken at
+    NAV_REFERENCE_DISTANCE_M meters away, so if the matched features now
+    appear `scale` times bigger/smaller in the live frame, the user's
+    distance is roughly NAV_REFERENCE_DISTANCE_M / scale (basic inverse-
+    scaling pinhole-camera geometry — same principle as bbox_dist/face_dist
+    elsewhere in this file, just applied to the ORB homography scale)."""
+    if scale<=0.01: return -1.0
+    dist=NAV_REFERENCE_DISTANCE_M/scale
+    return round(max(0.3,min(dist,20.0)),1)
 
 # ══════════════════════════════════════════════════════════════════
 # NAV WORKER
@@ -1531,7 +2262,10 @@ def nav_worker():
             arrived=sim>=ARRIVAL_THRESHOLD
             if arrived: direction="arrived"
             depth=-1.0
-            if arrow_dst and MIDAS_OK: depth=estimate_depth_at(frame,arrow_dst[0],arrow_dst[1])
+            if arrow_dst: depth=estimate_depth_at(orb_res.get("scale",0.0))
+            if orb_res.get("matched_angle") is not None:
+                print(f"[NavWorker] matched ref photo bearing ≈ {orb_res['matched_angle']:.0f}° "
+                      f"(idx={orb_res.get('matched_idx')})")
             with _nav_lock:
                 _nav_state.update({"sim":sim,"direction":direction,"offset_x":offset_x,
                                    "arrow_dst":arrow_dst,"n_matches":n_matches,
@@ -1543,8 +2277,8 @@ def nav_worker():
                     if lang=="english": speak(f"You have arrived at {dest}")
                     elif lang=="hindi": speak(f"{dest} पहुंच गए")
                     elif lang=="tamil": speak(f"{dest} வந்துவிட்டீர்கள்")
-                    elif lang=="kannada": speak(f"{dest} ತಲುಪಿದ್ದೀರಿ")
-                    elif lang=="malayalam": speak(f"{dest} എത്തിയിരിക്കുന്നു")
+                    elif lang=="kannada": speak(f"{dest} ತಲುಪಿದ್ದೀరి")
+                    elif lang=="malayalam": speak(f"{dest} ఎత్తియిరక్కున్న్")
                     else: speak(f"{dest} చేరుకున్నారు")
                     last_speak_time=now
                 elif direction!=last_direction or now-last_speak_time>6.0:
@@ -1557,9 +2291,9 @@ def nav_worker():
                     elif lang=="tamil":
                         speak({"left":"இடது திரும்பவும்","right":"வலது திரும்பவும்","forward":"முன்னே செல்லவும்"}.get(direction,"முன்னே செல்லவும்"))
                     elif lang=="kannada":
-                        speak({"left":"ಎಡಕ್ಕೆ ತಿರುಗಿ","right":"ಬಲಕ್ಕೆ ತಿರುಗಿ","forward":"ಮುಂದೆ ಹೋಗಿ"}.get(direction,"ಮುಂದೆ ಹೋಗಿ"))
+                        speak({"left":"ఎడక్కు తిరుగి","right":"బలక్కు తిరుగి","forward":"ముందే హోగి"}.get(direction,"ముందే హోగి"))
                     elif lang=="malayalam":
-                        speak({"left":"ഇടത്തോട്ട് തിരിയുക","right":"വലത്തോട്ട് തിരിയുക","forward":"മുന്നോട്ട് പോകുക"}.get(direction,"മുന്നോട്ട് പോകുക"))
+                        speak({"left":"ఇడత్తోట్ట్ తిరియుక","right":"వలత్తోట్ట్ తిరియుక","forward":"మున్నోట్ట్ పోకుక"}.get(direction,"మున్నోట్ట్ పోకుక"))
                     else:
                         te_dir=NAV_MSG.get(direction,"ముందుకు వెళ్ళండి")
                         depth_str=f" {depth:.0f} మీటర్లు" if depth>0 else ""; speak(f"{te_dir}{depth_str}")
@@ -1634,7 +2368,7 @@ def draw_default_hud(frame,yolo_cache,face_results):
         cv2.putText(frame,label,(l+5,t-6),F,0.72,(255,255,255),2)
         cv2.putText(frame,side,(l,b+22),F,0.52,(0,200,255),2)
     cv2.rectangle(frame,(0,h-32),(w,h),(10,10,10),-1)
-    cv2.putText(frame,f"Obj:{len(yolo_cache)}  Faces:{len(fr_copy)}  |  Lang:{_current_lang.upper()}  |  S=Save  W=Nav  Q=Quit",
+    cv2.putText(frame,f"Obj:{len(yolo_cache)}  Faces:{len(fr_copy)}  |  Lang:{_current_lang.upper()}  |  S=Save  W=Nav  J=Listen  Q=Quit",
                 (10,h-10),F,0.47,(160,160,160),1)
 
 def draw_save_face_banner(frame):
@@ -1642,9 +2376,11 @@ def draw_save_face_banner(frame):
     label_map={"save_place":"SAVING PLACE — YOLO & FACE ON HOLD",
                "listening":"VOICE COMMAND ACTIVE — LISTENING...",
                "send_msg":"SEND MESSAGE MODE — PLEASE SPEAK",
-               "sos":"** SOS / EMERGENCY MODE **"}
+               "sos":"** SOS / EMERGENCY MODE **",
+               "describe":"DESCRIBING SCENE — SAY CANCEL TO STOP",
+               "ai_mode":"AI MODE — ASK YOUR QUESTION, SAY CANCEL TO STOP"}
     label=label_map.get(mode,"SAVING FACE — YOLO & NAV ON HOLD")
-    color_map={"listening":(0,180,0),"send_msg":(100,50,0),"sos":(0,0,180)}
+    color_map={"listening":(0,180,0),"send_msg":(100,50,0),"sos":(0,0,180),"describe":(120,60,0),"ai_mode":(120,0,120)}
     color=color_map.get(mode,(0,50,100))
     cv2.rectangle(frame,(0,0),(w,50),color,-1)
     cv2.putText(frame,label,(10,32),cv2.FONT_HERSHEY_SIMPLEX,0.72,(0,220,255),2)
@@ -1660,16 +2396,24 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT,720)
     if not cap.isOpened(): print("❌ Camera failed!"); return
 
+    # Create window + flush stale keypresses from the auth phase so the
+    # window doesn't get an instant 'q'/ESC from buffered input.
+    cv2.namedWindow("DRISHTI", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("DRISHTI", 1280, 720)
+    for _ in range(20):
+        cv2.waitKey(1)
+
     print("\n✅ Camera started")
     print("   Default: YOLO + Face Recognition")
-    print("   S=Save  W=Navigate  Q=Quit")
-    print("   Voice: 'listen'→menu  'sos'→emergency  'send message'→SMS\n")
+    print("   S=Save  W=Navigate  J=Listen (same as earphone button)  Q=Quit")
+    print("   Voice: 'listen'→menu  'sos'→emergency  'send message'→SMS  'describe'→scene description  'ai mode'→ask anything\n")
 
     threading.Thread(target=nav_worker,daemon=True,name="NavWorker").start()
 
     if SR_OK:
         threading.Thread(target=_voice_command_thread,daemon=True,name="VoiceCmd").start()
-        speak_force("దృష్టి సిద్ధంగా ఉంది. listen అని చెప్పి ఆదేశాలు ఇవ్వండి")
+        threading.Thread(target=_hotkey_watcher_thread,daemon=True,name="HotkeyWatcher").start()
+        speak("దృష్టి సిద్ధంగా ఉంది. listen అని చెప్పి ఆదేశాలు ఇవ్వండి")
     else:
         print("[VoiceCmd] Disabled — install SpeechRecognition and pyaudio")
 
@@ -1678,205 +2422,250 @@ def main() -> None:
     yolo_cache:list=[]; frame_count=0; fps=0.0; fps_timer=time.time()
 
     while True:
-        ret,frame=cap.read()
-        if not ret: break
-        frame_count+=1; now=time.time(); mode=get_mode()
-        if frame_count%30==0:
-            fps=30.0/max(now-fps_timer,1e-6); fps_timer=now
-        if mode=="default":
-            small=cv2.resize(frame,(0,0),fx=FACE_SCALE,fy=FACE_SCALE); _latest_small[0]=small
-        if mode=="nav": _nav_frame[0]=frame.copy()
-        if mode=="ocr": _ocr_frame[0]=frame.copy()
-
-        # Input queue
-        while not _input_queue.empty():
-            tag,val=_input_queue.get_nowait()
-            if tag=="save_choice":
-                if val.lower()=="f": threading.Thread(target=_save_face_thread,args=(cap,),daemon=True).start()
-                elif val.lower()=="p": _ask("save_place_name","[SavePlace] Place name: ")
-                else: print(f"[Save] Unknown choice '{val}'")
-            elif tag=="save_place_name":
-                if val: threading.Thread(target=_save_place_thread,args=(cap,val),daemon=True).start()
-                else: print("[SavePlace] No name — skipped."); set_mode("default")
-            elif tag=="nav_dest":
-                if val in DB.places:
-                    nav_dest=val; ref_thumb=DB.places[val]["images"][0]
-                    _nav_dest[0]=val; _nav_stop.clear()
-                    with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0,"n_matches":0,"confidence":0.0,"depth":-1.0,"arrow_dst":None})
-                    arrived_time=0.0; set_mode("nav"); speak(f"{val} వైపు నావిగేషన్ మొదలవుతుంది"); print(f"\n✅ Navigating to: {val}\n")
-                else: print(f"❌ '{val}' not found."); set_mode("default")
-            elif tag=="reset_dest":
-                if val in DB.places:
-                    nav_dest=val; _nav_dest[0]=val; ref_thumb=DB.places[val]["images"][0]; arrived_time=0.0
-                    speak(f"{val} వైపు నావిగేషన్ మొదలవుతుంది"); print(f"✅ Destination → {val}")
-                else: print(f"❌ '{val}' not in places.")
-
-        # Voice command queue
-        while not _vc_queue.empty():
-            vc_tag,vc_val=_vc_queue.get_nowait()
-            if vc_tag=="quit":
-                _face_stop.set(); _nav_stop.set(); _vc_stop.set()
-                _ocr_stop_flag.set(); _ocr_active.clear()
-                cap.release(); cv2.destroyAllWindows(); pygame.mixer.quit()
-                print("\nGoodbye."); return
-            elif vc_tag=="vc_stop_nav":
-                if get_mode()=="nav":
-                    set_mode("default"); _nav_dest[0]=None; nav_dest=""; ref_thumb=None; arrived_time=0.0
-                    with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
-            elif vc_tag=="vc_nav_dest":
-                dest_name=vc_val
-                if dest_name in DB.places:
-                    nav_dest=dest_name; ref_thumb=DB.places[dest_name]["images"][0]
-                    _nav_dest[0]=dest_name; _nav_stop.clear()
-                    with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0,"n_matches":0,"confidence":0.0,"depth":-1.0,"arrow_dst":None})
-                    arrived_time=0.0; set_mode("nav"); print(f"[VoiceCmd] Navigating to: {dest_name}")
-            elif vc_tag=="vc_save_place":
-                if get_mode()=="default": threading.Thread(target=_save_place_thread,args=(cap,vc_val),daemon=True).start()
-            elif vc_tag=="vc_save_face":
-                if get_mode()=="default": threading.Thread(target=_save_face_thread_named,args=(cap,vc_val),daemon=True).start()
-            elif vc_tag=="vc_start_ocr":
-                if get_mode()=="default": start_ocr_mode(cap)
-            elif vc_tag=="vc_stop_ocr":
-                stop_ocr_mode()
-
-        # Render
-        display=frame.copy(); mode=get_mode()
-
-        if mode in ("save_face","save_place","listening","send_msg","sos"):
-            draw_save_face_banner(display)
-            action_map={"save_place":"saving place...","listening":"voice command — say your command...",
-                        "send_msg":"send message mode — speak the number and message...",
-                        "sos":"SOS emergency mode..."}
-            action=action_map.get(mode,"saving face...")
-            cv2.putText(display,f"Please wait — {action}",(10,display.shape[0]-15),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,200,255),2)
-            cv2.imshow("DRISHTI",display); cv2.waitKey(1); continue
-
-        elif mode=="ocr":
-            if _ocr_last_text:
-                h_d2,w_d2=display.shape[:2]
-                cv2.rectangle(display,(0,h_d2-80),(w_d2,h_d2-45),(0,40,0),-1)
-                disp_text=_ocr_last_text[:80]+"..." if len(_ocr_last_text)>80 else _ocr_last_text
-                cv2.putText(display,disp_text,(10,h_d2-55),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,100),1)
-            h_d,w_d=display.shape[:2]
-            cv2.rectangle(display,(0,0),(w_d,45),(0,60,0),-1)
-            cv2.putText(display,"OCR MODE | Point camera at text | Say CANCEL to stop",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,255,100),2)
-            cv2.imshow("DRISHTI",display)
-            key_ocr=cv2.waitKey(1)&0xFF
-            if key_ocr==27 or key_ocr==ord("q"): stop_ocr_mode()
-            continue
-
-        elif mode=="nav":
-            with _nav_lock: state=dict(_nav_state)
-            gray=cv2.cvtColor(display,cv2.COLOR_BGR2GRAY); kps_d,_=_orb.detectAndCompute(gray,None)
-            if kps_d:
-                for kp in kps_d[:30]: cv2.circle(display,(int(kp.pt[0]),int(kp.pt[1])),3,(0,200,255),-1)
-            if not state["arrived"]: draw_nav_arrow(display,state["direction"],state["arrow_dst"],state["confidence"])
-            if ref_thumb is not None:
-                tw,th=160,100; thumb=cv2.resize(ref_thumb,(tw,th)); h_d,w_d=display.shape[:2]
-                display[15:15+th,w_d-tw-5:w_d-5]=thumb
-                cv2.putText(display,f"Target: {nav_dest}",(w_d-tw-5,15+th+18),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,200),1)
-            draw_nav_hud(display,nav_dest,state["sim"],state["direction"],state["n_matches"],state["depth"],state["confidence"])
-            if state["arrived"]:
-                if arrived_time==0.0: arrived_time=now; print(f"\n✅ Arrived at '{nav_dest}'! Back to default in 3s...")
-                if now-arrived_time>=3.0:
-                    set_mode("default"); _nav_dest[0]=None; arrived_time=0.0; nav_dest=""; ref_thumb=None
-                    with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
-                    print("[NAV] Back to default mode.\n")
-            else: arrived_time=0.0
-
-        else:  # default
-            if frame_count%FRAME_SKIP==0:
-                results=yolo(frame,verbose=False,conf=CONF_THRESHOLD); detections=[]
-                for r in results:
-                    for box in r.boxes:
-                        cls=int(box.cls[0]); name=yolo.names[cls]
-                        x1,y1,x2,y2=map(int,box.xyxy[0]); cx=(x1+x2)//2; bh=y2-y1
-                        ref=OBJECT_REF_HEIGHT_M.get(name,DEFAULT_REF_H)
-                        dist=bbox_dist(bh,ref); side=direction_te(cx,frame.shape[1])
-                        detections.append((name,dist,side,x1,y1,x2,y2))
-                detections.sort(key=lambda d:d[1]); yolo_cache=detections
-                if yolo_cache and now-last_yolo_speak>YOLO_COOLDOWN:
-                    n0,d0,s0=yolo_cache[0][0],yolo_cache[0][1],yolo_cache[0][2]
-                    tel=TELUGU_OBJ.get(n0,n0); lang=_current_lang
-                    if lang=="english":
-                        sv0={"Left":"on your left","Right":"on your right","Center":"in front of you"}.get(s0,s0)
-                        speak(f"{sv0} {n0} {d0} meters away watch out")
-                    elif lang=="hindi":
-                        sv0={"Left":"బాईం తరఫ","Right":"దాईం తరఫ","Center":"సామ్నే"}.get(s0,s0)
-                        speak(f"{sv0} {tel} {d0} మీటర్ దూర్ హై సావధాన్")
-                    elif lang=="tamil":
-                        sv0={"Left":"இடது பக்கம்","Right":"வலது பக்கம்","Center":"முன்னால்"}.get(s0,s0)
-                        speak(f"{sv0} {tel} {d0} மீட்டர் தொலைவில் உள்ளது கவனமாக இருங்கள்")
-                    elif lang=="kannada":
-                        sv0={"Left":"ಎಡಭಾಗ","Right":"ಬಲಭಾಗ","Center":"ಮುಂದೆ"}.get(s0,s0)
-                        speak(f"{sv0} {tel} {d0} ಮೀಟರ್ ದೂರದಲ್ಲಿದೆ ಎಚ್ಚರಿಕೆ")
-                    elif lang=="malayalam":
-                        sv0={"Left":"ഇടതുവശം","Right":"വലതുവശം","Center":"മുന്നിൽ"}.get(s0,s0)
-                        speak(f"{sv0} {tel} {d0} മീറ്റർ അകലെ ഉണ്ട് ശ്രദ്ധിക്കുക")
-                    else:
-                        sv0={"Left":"ఎడమ వైపు","Right":"కుడి వైపు","Center":"మీ ముందు"}.get(s0,s0)
-                        speak(f"{sv0} {tel} {d0} మీటర్ల దూరంలో వున్నారు చూసుకోండి")
-                    last_yolo_speak=now
-            with _rec_lock: face_results_snap=list(_rec_results)
-            seen=set()
-            sorted_faces=sorted(face_results_snap,key=lambda d:-(int(d[4]/FACE_SCALE)-int(d[2]/FACE_SCALE)))
-            for item in sorted_faces:
-                name,conf,top,right,bottom,left=item; seen.add(name)
-                t=int(top/FACE_SCALE); r2=int(right/FACE_SCALE); b=int(bottom/FACE_SCALE); l2=int(left/FACE_SCALE)
-                dist=face_dist(t,b); side=direction_te((l2+r2)//2,frame.shape[1])
-                last_t=last_face_speak.get(name,0.0)
-                if now-last_t>=FACE_COOLDOWN:
-                    last_face_speak[name]=now; lang=_current_lang
-                    if lang=="english":
-                        sv={"Left":"on your left","Right":"on your right","Center":"in front of you"}.get(side,side)
-                        msg=f"{sv} {'unknown person' if name=='Unknown' else name} {dist:.1f} meters away please be careful"
-                    elif lang=="hindi":
-                        sv={"Left":"బాईం తరఫ","Right":"దాయీం తరఫ","Center":"సామ్నే"}.get(side,side)
-                        msg=f"{sv} {'అజ్ఞాత వ్యక్తి' if name=='Unknown' else name} {dist:.1f} మీటర్ దూర్ హై సావధాన్ రహేం"
-                    elif lang=="tamil":
-                        sv={"Left":"இடது பக்கம்","Right":"வலது பக்கம்","Center":"முன்னால்"}.get(side,side)
-                        msg=f"{sv} {'தெரியாத நபர்' if name=='Unknown' else name} {dist:.1f} மீட்டர் தொலைவில் கவனமாக இருங்கள்"
-                    elif lang=="kannada":
-                        sv={"Left":"ಎಡಭಾಗ","Right":"ಬಲಭಾಗ","Center":"ಮುಂದೆ"}.get(side,side)
-                        msg=f"{sv} {'ಅಪರಿಚಿತ ವ್ಯಕ್ತಿ' if name=='Unknown' else name} {dist:.1f} ಮೀಟರ್ ದೂರದಲ್ಲಿದ್ದಾರೆ ಎಚ್ಚರಿಕೆ"
-                    elif lang=="malayalam":
-                        sv={"Left":"ഇടതുവശം","Right":"വലതുവശം","Center":"മുന്നിൽ"}.get(side,side)
-                        msg=f"{sv} {'അപരിചിതൻ' if name=='Unknown' else name} {dist:.1f} മീറ്റർ അകലെ ഉണ്ട് ശ്രദ്ധിക്കുക"
-                    else:
-                        sv={"Left":"ఎడమ వైపు","Right":"కుడి వైపు","Center":"మీ ముందు"}.get(side,side)
-                        msg=(f"{sv} గుర్తు తెలియని వ్యక్తి {dist:.1f} మీటర్ల దూరంలో వున్నారు చూసుకొని వెళ్ళండి"
-                             if name=="Unknown" else f"{sv} {name} {dist:.1f} మీటర్ల దూరంలో వున్నారు చూసుకొని వెళ్ళండి")
-                    speak(msg); break
-            for name in list(last_face_speak.keys()):
-                if name not in seen: del last_face_speak[name]
-            draw_default_hud(display,yolo_cache,_rec_results)
-
-        cv2.putText(display,f"{fps:.0f}fps",(display.shape[1]-75,display.shape[0]-52),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(100,100,100),1)
-        cv2.imshow("DRISHTI",display); key=cv2.waitKey(1)&0xFF
-
-        if key==ord("q"): break
-        if key==ord("s") and not _input_busy.is_set():
+        try:
+            ret,frame=cap.read()
+            if not ret:
+                print("[Main] Camera read failed — ret=False")
+                break
+            frame_count+=1; now=time.time(); mode=get_mode()
+            if frame_count%30==0:
+                fps=30.0/max(now-fps_timer,1e-6); fps_timer=now
             if mode=="default":
-                print("\n"+"═"*50+"\n  SAVE — F=Face  |  P=Place\n"+"═"*50)
-                _ask("save_choice","Enter F (face) or P (place): ")
-            elif mode=="nav": _ask("save_place_name","[SavePlace] Place name: ")
-        if key==ord("w") and mode=="default" and not _input_busy.is_set():
-            if not DB.places: print("\n⚠️  No saved places!\n")
-            else:
-                print("\n"+"═"*55+"\n  NAVIGATION — Available places:")
+                small=cv2.resize(frame,(0,0),fx=FACE_SCALE,fy=FACE_SCALE); _latest_small[0]=small
+            if mode=="nav": _nav_frame[0]=frame.copy()
+            if mode=="ocr": _ocr_frame[0]=frame.copy()
+            if mode=="describe": _describe_frame[0]=frame.copy()
+
+            # Input queue
+            while not _input_queue.empty():
+                tag,val=_input_queue.get_nowait()
+                if tag=="save_choice":
+                    if val.lower()=="f": threading.Thread(target=_save_face_thread,args=(cap,),daemon=True).start()
+                    elif val.lower()=="p": _ask("save_place_name","[SavePlace] Place name: ")
+                    else: print(f"[Save] Unknown choice '{val}'")
+                elif tag=="save_place_name":
+                    if val: threading.Thread(target=_save_place_thread,args=(cap,val),daemon=True).start()
+                    else: print("[SavePlace] No name — skipped."); set_mode("default")
+                elif tag=="nav_dest":
+                    if val in DB.places:
+                        nav_dest=val; ref_thumb=DB.places[val]["images"][0]
+                        _nav_dest[0]=val; _nav_stop.clear()
+                        with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0,"n_matches":0,"confidence":0.0,"depth":-1.0,"arrow_dst":None})
+                        arrived_time=0.0; set_mode("nav"); speak(f"{val} వైపు నావిగేషన్ మొదలవుతుంది"); print(f"\n✅ Navigating to: {val}\n")
+                    else: print(f"❌ '{val}' not found."); set_mode("default")
+                elif tag=="reset_dest":
+                    if val in DB.places:
+                        nav_dest=val; _nav_dest[0]=val; ref_thumb=DB.places[val]["images"][0]; arrived_time=0.0
+                        speak(f"{val} వైపు నావిగేషన్ మొదలవుతుంది"); print(f"✅ Destination → {val}")
+                    else: print(f"❌ '{val}' not in places.")
+
+            # Voice command queue
+            while not _vc_queue.empty():
+                vc_tag,vc_val=_vc_queue.get_nowait()
+                if vc_tag=="quit":
+                    _face_stop.set(); _nav_stop.set(); _vc_stop.set()
+                    _ocr_stop_flag.set(); _ocr_active.clear()
+                    _describe_stop.set()
+                    _ai_mode_stop.set()
+                    cap.release(); cv2.destroyAllWindows(); pygame.mixer.quit()
+                    print("\nGoodbye."); return
+                elif vc_tag=="vc_stop_nav":
+                    if get_mode()=="nav":
+                        set_mode("default"); _nav_dest[0]=None; nav_dest=""; ref_thumb=None; arrived_time=0.0
+                        with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
+                elif vc_tag=="vc_nav_dest":
+                    dest_name=vc_val
+                    if dest_name in DB.places:
+                        nav_dest=dest_name; ref_thumb=DB.places[dest_name]["images"][0]
+                        _nav_dest[0]=dest_name; _nav_stop.clear()
+                        with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0,"n_matches":0,"confidence":0.0,"depth":-1.0,"arrow_dst":None})
+                        arrived_time=0.0; set_mode("nav"); print(f"[VoiceCmd] Navigating to: {dest_name}")
+                elif vc_tag=="vc_save_place":
+                    if get_mode()=="default": threading.Thread(target=_save_place_thread,args=(cap,vc_val),daemon=True).start()
+                elif vc_tag=="vc_save_face":
+                    if get_mode()=="default": threading.Thread(target=_save_face_thread_named,args=(cap,vc_val),daemon=True).start()
+                elif vc_tag=="vc_start_ocr":
+                    if get_mode()=="default": start_ocr_mode(cap)
+                elif vc_tag=="vc_stop_ocr":
+                    stop_ocr_mode()
+                elif vc_tag=="vc_start_describe":
+                    if get_mode()=="default": start_describe_mode(cap)
+                elif vc_tag=="vc_stop_describe":
+                    stop_describe_mode()
+                elif vc_tag=="vc_start_ai_mode":
+                    if get_mode()=="default": start_ai_mode(cap)
+                elif vc_tag=="vc_stop_ai_mode":
+                    stop_ai_mode()
+
+            # Render
+            display=frame.copy(); mode=get_mode()
+
+            if mode in ("save_face","save_place","listening","send_msg","sos"):
+                draw_save_face_banner(display)
+                action_map={"save_place":"saving place...","listening":"voice command — say your command...",
+                            "send_msg":"send message mode — speak the number and message...",
+                            "sos":"SOS emergency mode..."}
+                action=action_map.get(mode,"saving face...")
+                cv2.putText(display,f"Please wait — {action}",(10,display.shape[0]-15),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,200,255),2)
+                cv2.imshow("DRISHTI",display); cv2.waitKey(1); continue
+
+            elif mode=="ocr":
+                if _ocr_last_text:
+                    h_d2,w_d2=display.shape[:2]
+                    cv2.rectangle(display,(0,h_d2-80),(w_d2,h_d2-45),(0,40,0),-1)
+                    disp_text=_ocr_last_text[:80]+"..." if len(_ocr_last_text)>80 else _ocr_last_text
+                    cv2.putText(display,disp_text,(10,h_d2-55),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,100),1)
+                h_d,w_d=display.shape[:2]
+                cv2.rectangle(display,(0,0),(w_d,45),(0,60,0),-1)
+                cv2.putText(display,"OCR MODE | Point camera at text | Say CANCEL to stop",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,255,100),2)
+                cv2.imshow("DRISHTI",display)
+                key_ocr=cv2.waitKey(1)&0xFF
+                if key_ocr==27 or key_ocr==ord("q"): stop_ocr_mode()
+                continue
+
+            elif mode=="describe":
+                draw_save_face_banner(display)
+                h_d3,w_d3=display.shape[:2]
+                cv2.putText(display,"Describing scene... say CANCEL to stop",(10,h_d3-15),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,200,255),2)
+                cv2.imshow("DRISHTI",display)
+                key_desc=cv2.waitKey(1)&0xFF
+                if key_desc==27 or key_desc==ord("q"): stop_describe_mode()
+                continue
+
+            elif mode=="ai_mode":
+                draw_save_face_banner(display)
+                h_d4,w_d4=display.shape[:2]
+                cv2.putText(display,"AI mode... ask your question, say CANCEL to stop",(10,h_d4-15),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,200,255),2)
+                cv2.imshow("DRISHTI",display)
+                key_ai=cv2.waitKey(1)&0xFF
+                if key_ai==27 or key_ai==ord("q"): stop_ai_mode()
+                continue
+
+            elif mode=="nav":
+                with _nav_lock: state=dict(_nav_state)
+                gray=cv2.cvtColor(display,cv2.COLOR_BGR2GRAY); kps_d,_=_orb.detectAndCompute(gray,None)
+                if kps_d:
+                    for kp in kps_d[:30]: cv2.circle(display,(int(kp.pt[0]),int(kp.pt[1])),3,(0,200,255),-1)
+                if not state["arrived"]: draw_nav_arrow(display,state["direction"],state["arrow_dst"],state["confidence"])
+                if ref_thumb is not None:
+                    tw,th=160,100; thumb=cv2.resize(ref_thumb,(tw,th)); h_d,w_d=display.shape[:2]
+                    display[15:15+th,w_d-tw-5:w_d-5]=thumb
+                    cv2.putText(display,f"Target: {nav_dest}",(w_d-tw-5,15+th+18),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,200),1)
+                draw_nav_hud(display,nav_dest,state["sim"],state["direction"],state["n_matches"],state["depth"],state["confidence"])
+                if state["arrived"]:
+                    if arrived_time==0.0: arrived_time=now; print(f"\n✅ Arrived at '{nav_dest}'! Back to default in 3s...")
+                    if now-arrived_time>=3.0:
+                        set_mode("default"); _nav_dest[0]=None; arrived_time=0.0; nav_dest=""; ref_thumb=None
+                        with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
+                        print("[NAV] Back to default mode.\n")
+                else: arrived_time=0.0
+
+            else:  # default
+                if frame_count%FRAME_SKIP==0:
+                    results=yolo(frame,verbose=False,conf=CONF_THRESHOLD); detections=[]
+                    for r in results:
+                        for box in r.boxes:
+                            cls=int(box.cls[0]); name=yolo.names[cls]
+                            x1,y1,x2,y2=map(int,box.xyxy[0]); cx=(x1+x2)//2; bh=y2-y1
+                            ref=OBJECT_REF_HEIGHT_M.get(name,DEFAULT_REF_H)
+                            dist=bbox_dist(bh,ref); side=direction_te(cx,frame.shape[1])
+                            detections.append((name,dist,side,x1,y1,x2,y2))
+                    detections.sort(key=lambda d:d[1]); yolo_cache=detections
+                    if yolo_cache and now-last_yolo_speak>YOLO_COOLDOWN:
+                        n0,d0,s0=yolo_cache[0][0],yolo_cache[0][1],yolo_cache[0][2]
+                        tel=TELUGU_OBJ.get(n0,n0); lang=_current_lang
+                        if lang=="english":
+                            sv0={"Left":"on your left","Right":"on your right","Center":"in front of you"}.get(s0,s0)
+                            speak(f"{sv0} {n0} {d0} meters away watch out")
+                        elif lang=="hindi":
+                            sv0={"Left":"బాईం తరఫ","Right":"దాయీం తరఫ","Center":"సామ్నే"}.get(s0,s0)
+                            speak(f"{sv0} {tel} {d0} మీటర్ దూర్ హై సావధాన్")
+                        elif lang=="tamil":
+                            sv0={"Left":"இடது பக்கம்","Right":"வலது பக்கம்","Center":"முன்னால்"}.get(s0,s0)
+                            speak(f"{sv0} {tel} {d0} மீட்டர் தொலைவில் உள்ளது கவனமாக இருங்கள்")
+                        elif lang=="kannada":
+                            sv0={"Left":"ఎడభాగ","Right":"బలభాగ","Center":"ముందే"}.get(s0,s0)
+                            speak(f"{sv0} {tel} {d0} ಮీటర్ ದూరదల్లిదే ఎచ్చరిక")
+                        elif lang=="malayalam":
+                            sv0={"Left":"ఇడతువశం","Right":"వలతువశం","Center":"మున్నిల్"}.get(s0,s0)
+                            speak(f"{sv0} {tel} {d0} మీటర్ అకలే ఉంద్ శ్రద్ధిక్కుక")
+                        else:
+                            sv0={"Left":"ఎడమ వైపు","Right":"కుడి వైపు","Center":"మీ ముందు"}.get(s0,s0)
+                            speak(f"{sv0} {tel} {d0} మీటర్ల దూరంలో వున్నారు చూసుకోండి")
+                        last_yolo_speak=now
+                with _rec_lock: face_results_snap=list(_rec_results)
+                seen=set()
+                sorted_faces=sorted(face_results_snap,key=lambda d:-(int(d[4]/FACE_SCALE)-int(d[2]/FACE_SCALE)))
+                for item in sorted_faces:
+                    name,conf,top,right,bottom,left=item; seen.add(name)
+                    t=int(top/FACE_SCALE); r2=int(right/FACE_SCALE); b=int(bottom/FACE_SCALE); l2=int(left/FACE_SCALE)
+                    dist=face_dist(t,b); side=direction_te((l2+r2)//2,frame.shape[1])
+                    last_t=last_face_speak.get(name,0.0)
+                    if now-last_t>=FACE_COOLDOWN:
+                        last_face_speak[name]=now; lang=_current_lang
+                        if lang=="english":
+                            sv={"Left":"on your left","Right":"on your right","Center":"in front of you"}.get(side,side)
+                            msg=f"{sv} {'unknown person' if name=='Unknown' else name} {dist:.1f} meters away please be careful"
+                        elif lang=="hindi":
+                            sv={"Left":"బాईం తరఫ","Right":"దాయీం తరఫ","Center":"సామ్నే"}.get(side,side)
+                            msg=f"{sv} {'అజ్ఞాత వ్యక్తి' if name=='Unknown' else name} {dist:.1f} మీటర్ దూర్ హై సావధాన్ రహేం"
+                        elif lang=="tamil":
+                            sv={"Left":"இடது பக்கம்","Right":"வலது பக்கம்","Center":"முன்னால்"}.get(side,side)
+                            msg=f"{sv} {'తెరియాత నపర్' if name=='Unknown' else name} {dist:.1f} மீட்டர் தொலைவில் கவனமாக இருங்கள்"
+                        elif lang=="kannada":
+                            sv={"Left":"ఎడభాగ","Right":"బలభాగ","Center":"ముందే"}.get(side,side)
+                            msg=f"{sv} {'అపరిచిత వ్యక్తి' if name=='Unknown' else name} {dist:.1f} మీటర్ దూరదల్లిదారే ఎచ్చరిక"
+                        elif lang=="malayalam":
+                            sv={"Left":"ఇడతువశం","Right":"వలతువశం","Center":"మున్నిల్"}.get(side,side)
+                            msg=f"{sv} {'అపరిచితన్' if name=='Unknown' else name} {dist:.1f} మీటర్ అకలే ఉంద్ శ్రద్ధిక్కుక"
+                        else:
+                            sv={"Left":"ఎడమ వైపు","Right":"కుడి వైపు","Center":"మీ ముందు"}.get(side,side)
+                            msg=(f"{sv} గుర్తు తెలియని వ్యక్తి {dist:.1f} మీటర్ల దూరంలో వున్నారు చూసుకొని వెళ్ళండి"
+                                 if name=="Unknown" else f"{sv} {name} {dist:.1f} మీటర్ల దూరంలో వున్నారు చూసుకొని వెళ్ళండి")
+                        speak(msg); break
+                for name in list(last_face_speak.keys()):
+                    if name not in seen: del last_face_speak[name]
+                draw_default_hud(display,yolo_cache,_rec_results)
+
+            cv2.putText(display,f"{fps:.0f}fps",(display.shape[1]-75,display.shape[0]-52),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.5,(100,100,100),1)
+            cv2.imshow("DRISHTI",display); key=cv2.waitKey(1)&0xFF
+
+            if key==ord("q"): break
+            if key==ord("j"):
+                # PC-keyboard equivalent of a single earphone-button press —
+                # works even with no earphone connected at all.
+                _manual_activate_pending.set()
+            if key==ord("s") and not _input_busy.is_set():
+                if mode=="default":
+                    print("\n"+"═"*50+"\n  SAVE — F=Face  |  P=Place\n"+"═"*50)
+                    _ask("save_choice","Enter F (face) or P (place): ")
+                elif mode=="nav": _ask("save_place_name","[SavePlace] Place name: ")
+            if key==ord("w") and mode=="default" and not _input_busy.is_set():
+                if not DB.places: print("\n⚠️  No saved places!\n")
+                else:
+                    print("\n"+"═"*55+"\n  NAVIGATION — Available places:")
+                    for i,nm in enumerate(DB.names(),1): print(f"  {i}. {nm}")
+                    print("═"*55); _ask("nav_dest","Enter destination name: "); set_mode("nav")
+            if key==ord("r") and mode=="nav" and not _input_busy.is_set():
                 for i,nm in enumerate(DB.names(),1): print(f"  {i}. {nm}")
-                print("═"*55); _ask("nav_dest","Enter destination name: "); set_mode("nav")
-        if key==ord("r") and mode=="nav" and not _input_busy.is_set():
-            for i,nm in enumerate(DB.names(),1): print(f"  {i}. {nm}")
-            _ask("reset_dest","New destination: ")
-        if key==27 and mode=="nav":
-            set_mode("default"); nav_dest=""; ref_thumb=None; arrived_time=0.0; _nav_dest[0]=None
-            with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
-            print("\n[NAV] Exited → back to default mode.\n")
+                _ask("reset_dest","New destination: ")
+            if key==27 and mode=="nav":
+                set_mode("default"); nav_dest=""; ref_thumb=None; arrived_time=0.0; _nav_dest[0]=None
+                with _nav_lock: _nav_state.update({"arrived":False,"direction":"forward","sim":0.0})
+                print("\n[NAV] Exited → back to default mode.\n")
+
+        except Exception as _main_ex:
+            print(f"[Main] CRASH: {_main_ex}")
+            import traceback; traceback.print_exc()
+            break
 
     _face_stop.set(); _nav_stop.set(); _vc_stop.set()
     _ocr_stop_flag.set(); _ocr_active.clear()
+    _describe_stop.set()
+    _ai_mode_stop.set()
     cap.release(); cv2.destroyAllWindows(); pygame.mixer.quit()
     print("\nGoodbye.")
 
